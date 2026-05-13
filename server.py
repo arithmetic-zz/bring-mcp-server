@@ -54,22 +54,21 @@ async def get_bring_client() -> Bring:
     global _BRING_CLIENT, _BRING_SESSION
 
     async with _BRING_LOCK:
-        if _BRING_CLIENT is not None:
-            return _BRING_CLIENT
+        if _BRING_CLIENT is None:
+            email, password = _require_credentials()
+            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+            client = Bring(session, email, password)
 
-        email, password = _require_credentials()
-        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
-        client = Bring(session, email, password)
+            try:
+                await client.login()
+            except Exception:
+                await session.close()
+                raise
 
-        try:
-            await client.login()
-        except Exception:
-            await session.close()
-            raise
+            _BRING_SESSION = session
+            _BRING_CLIENT = client
 
-        _BRING_SESSION = session
-        _BRING_CLIENT = client
-        return client
+        return _BRING_CLIENT
 
 
 async def close_bring_client() -> None:
@@ -224,7 +223,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "operation": {
                         "type": "string",
-                        "description": "ADD, COMPLETE, or REMOVE",
+                        "description": "ADD (add to list), COMPLETE (move to Recently Purchased), or REMOVE (delete). Note: COMPLETE moves items to recently purchased rather than checking them off.",
                         "enum": ["ADD", "COMPLETE", "REMOVE"],
                     },
                 },
@@ -271,7 +270,7 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent
         spec = arguments.get("spec") or ""
         item_uuid = arguments.get("uuid")
         await bring.save_item(list_uuid, item_id, spec, item_uuid)
-        return _text(f"✓ Added '{item_id}' to the list.")
+        return _text(f"✓ Added or updated '{item_id}' in the list.")
 
     if name == "remove_item":
         list_uuid = _list_uuid(arguments)
@@ -320,6 +319,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     except BringException:
         logger.exception("Bring API error for tool '%s'", name)
         return _text("Bring API error.")
+    except ValueError as exc:
+        # Credentials missing or invalid operation enum
+        logger.exception("Value error for tool '%s': %s", name, exc)
+        return _text(str(exc))
     except Exception:
         logger.exception("Unexpected error while handling tool '%s'", name)
         return _text("Unexpected server error.")
