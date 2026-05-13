@@ -12,8 +12,8 @@ This server exposes Bring! shopping list operations to MCP clients such as Claud
 - `get_list` — fetch a single list with its items
 - `add_item` — add an item to a list
 - `remove_item` — remove an item from a list
-- `complete_item` — mark an item as completed
-- `batch_update` — apply bulk list updates
+- `complete_item` — move an item to Recently Purchased (complete it in Bring!)
+- `batch_update` — apply bulk operations (ADD, COMPLETE, or REMOVE) to multiple items
 
 ## APIs and dependencies
 
@@ -73,13 +73,15 @@ python server.py
 
 ```bash
 python -m py_compile server.py
-python -m unittest
+python -m pytest tests/ -v
 ```
 
 ## Notes
 
 - The server keeps one authenticated Bring client per process and reuses the HTTP session.
-- Errors are translated into short user-facing messages.
+- `save_item` (used by `add_item`) is an upsert — adding an item that already exists updates it rather than creating a duplicate.
+- `complete_item` moves items to the "Recently Purchased" list; it does not check items off in place.
+- Errors are caught, logged, and translated into short user-facing messages.
 
 ## License
 
