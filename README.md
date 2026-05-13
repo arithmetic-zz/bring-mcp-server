@@ -1,19 +1,28 @@
 # Bring! MCP Server
 
-Model Context Protocol (MCP) Server für die Bring! Einkaufslisten-API.
+A Model Context Protocol (MCP) server for the Bring! shopping list API.
 
-## Überblick
+## What it does
 
-Dieser MCP-Server ermöglicht es MCP-Clients (Claude Desktop, Cursor, etc.) mit der Bring! Einkaufslisten-API zu interagieren.
+This server exposes Bring! shopping list operations to MCP clients such as Claude Desktop or Cursor.
 
-## Features
+## Available tools
 
-- **get_lists** – Alle Einkaufslisten abrufen
-- **get_list** – Eine spezifische Liste mit Items abrufen
-- **add_item** – Item zur Liste hinzufügen
-- **remove_item** – Item aus Liste entfernen
-- **complete_item** – Item als erledigt markieren
-- **batch_update** – Batch-Operationen (mehrere Items gleichzeitig)
+- `get_lists` — list all shopping lists
+- `get_list` — fetch a single list with its items
+- `add_item` — add an item to a list
+- `remove_item` — remove an item from a list
+- `complete_item` — mark an item as completed
+- `batch_update` — apply bulk list updates
+
+## APIs and dependencies
+
+### External APIs / services
+
+- **Bring! Shopping List API** — used through the `bring-api` Python package
+- **MCP (Model Context Protocol)** — served via the `mcp` Python package
+- **aiohttp** — async HTTP client used by `bring-api`
+- **python-dotenv** — optional `.env` loading for local development
 
 ## Installation
 
@@ -21,31 +30,29 @@ Dieser MCP-Server ermöglicht es MCP-Clients (Claude Desktop, Cursor, etc.) mit 
 pip install -r requirements.txt
 ```
 
-## Konfiguration
+## Configuration
 
-Umgebungsvariablen setzen:
+Set these environment variables:
 
 ```bash
-export BRING_EMAIL="deine@email.de"
-export BRING_PASSWORD="deinpasswort"
+export BRING_EMAIL="your@email.com"
+export BRING_PASSWORD="your-password"
 ```
 
-Oder in einer `.env`-Datei:
+Or create a local `.env` file:
 
-```
-BRING_EMAIL=deine@email.de
-BRING_PASSWORD=deinpasswort
+```env
+BRING_EMAIL=your@email.com
+BRING_PASSWORD=your-password
 ```
 
-## Starten
+## Run
 
 ```bash
 python server.py
 ```
 
-## Claude Desktop Integration
-
-Füge in `claude_desktop_config.json` hinzu:
+## Claude Desktop integration
 
 ```json
 {
@@ -54,32 +61,26 @@ Füge in `claude_desktop_config.json` hinzu:
       "command": "python",
       "args": ["/path/to/bring-mcp-server/server.py"],
       "env": {
-        "BRING_EMAIL": "deine@email.de",
-        "BRING_PASSWORD": "deinpasswort"
+        "BRING_EMAIL": "your@email.com",
+        "BRING_PASSWORD": "your-password"
       }
     }
   }
 }
 ```
 
-## API-Endpunkte (als Referenz)
-
-| Tool | Beschreibung |
-|------|-------------|
-| `get_lists` | Alle Listen |
-| `get_list` | Liste mit UUID |
-| `add_item` | Item hinzufügen |
-| `remove_item` | Item entfernen |
-| `complete_item` | Item erledigen |
-| `batch_update` | Batch-Operation |
-
 ## Development
 
 ```bash
-pip install -r requirements.txt
-python server.py
+python -m py_compile server.py
+python -m unittest
 ```
 
-## Lizenz
+## Notes
+
+- The server keeps one authenticated Bring client per process and reuses the HTTP session.
+- Errors are translated into short user-facing messages.
+
+## License
 
 MIT
