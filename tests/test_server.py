@@ -28,7 +28,9 @@ class DummyBring:
         self.password = password
         self.login = AsyncMock()
         self.load_lists = AsyncMock(return_value={"lists": []})
-        self.get_list = AsyncMock(return_value={"name": "Groceries", "items": []})
+        self.get_list = AsyncMock(
+            return_value={"uuid": "list-1", "items": {"purchase": [], "recently": []}}
+        )
         self.save_item = AsyncMock()
         self.remove_item = AsyncMock()
         self.complete_item = AsyncMock()
@@ -40,7 +42,11 @@ class BringServerTests(IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await server.close_bring_client()
         DummyBring.instances.clear()
-        self.env_patch = patch.dict(os.environ, {"BRING_EMAIL": "markus@example.com", "BRING_PASSWORD": "secret"}, clear=False)
+        self.env_patch = patch.dict(
+            os.environ,
+            {"BRING_EMAIL": "markus@example.com", "BRING_PASSWORD": "secret"},
+            clear=False,
+        )
         self.env_patch.start()
 
     async def asyncTearDown(self):
@@ -69,10 +75,34 @@ class BringServerTests(IsolatedAsyncioTestCase):
         self.assertEqual(DummyBring.instances[0].login.await_count, 1)
         self.assertFalse(DummyBring.instances[0].session.closed)
 
+    async def test_get_list_formats_purchase_and_recently_sections(self):
+        fake = DummyBring(DummySession(), "markus@example.com", "secret")
+        fake.load_lists = AsyncMock(return_value={"lists": [{"name": "Zuhause", "listUuid": "list-1"}]})
+        fake.get_list = AsyncMock(
+            return_value={
+                "uuid": "list-1",
+                "items": {
+                    "purchase": [
+                        {"itemId": "Milk", "specification": "low-fat", "uuid": "item-1"},
+                    ],
+                    "recently": [
+                        {"itemId": "Bread", "specification": "whole grain", "uuid": "item-2"},
+                    ],
+                },
+            }
+        )
+
+        with patch.object(server, "get_bring_client", AsyncMock(return_value=fake)):
+            result = await server.call_tool("get_list", {"list_uuid": "list-1"})
+
+        self.assertIn("List: Zuhause", result[0].text)
+        self.assertIn("To buy:", result[0].text)
+        self.assertIn("• Milk (low-fat) [UUID: item-1]", result[0].text)
+        self.assertIn("Recently completed:", result[0].text)
+        self.assertIn("• Bread (whole grain) [UUID: item-2]", result[0].text)
+
     async def test_remove_and_complete_use_dedicated_api_methods(self):
         fake = DummyBring(DummySession(), "markus@example.com", "secret")
-        fake.load_lists = AsyncMock(return_value={"lists": []})
-        fake.get_list = AsyncMock(return_value={"name": "Groceries", "items": []})
 
         with patch.object(server, "get_bring_client", AsyncMock(return_value=fake)):
             result = await server.call_tool(
@@ -87,13 +117,11 @@ class BringServerTests(IsolatedAsyncioTestCase):
                 "complete_item",
                 {"list_uuid": "list-1", "item_id": "Milk", "item_uuid": "item-1", "spec": "low-fat"},
             )
-            self.assertIn("completed", result[0].text.lower())
+            self.assertIn("Recently Purchased", result[0].text)
             fake.complete_item.assert_awaited_once_with("list-1", "Milk", "low-fat", "item-1")
 
     async def test_batch_update_uses_enum(self):
         fake = DummyBring(DummySession(), "markus@example.com", "secret")
-        fake.load_lists = AsyncMock(return_value={"lists": []})
-        fake.get_list = AsyncMock(return_value={"name": "Groceries", "items": []})
 
         with patch.object(server, "get_bring_client", AsyncMock(return_value=fake)):
             await server.call_tool(
@@ -110,3 +138,17 @@ class BringServerTests(IsolatedAsyncioTestCase):
         self.assertEqual(args[0], "list-1")
         self.assertEqual(args[1], [{"itemId": "Milk"}])
         self.assertEqual(args[2], BringItemOperation.ADD)
+
+    async def test_validation_errors_are_user_facing(self):
+        result = await server.call_tool("add_item", {"list_uuid": "list-1"})
+
+        self.assertEqual(result[0].text, "Invalid request: item_id is required")
+
+    async def test_missing_credentials_are_reported_as_configuration_error(self):
+        with patch.dict(os.environ, {}, clear=True):
+            result = await server.call_tool("get_lists", {})
+
+        self.assertEqual(
+            result[0].text,
+            "Configuration error: BRING_EMAIL and BRING_PASSWORD must be set",
+        )

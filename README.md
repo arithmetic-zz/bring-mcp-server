@@ -1,33 +1,32 @@
 # Bring! MCP Server
 
-A Model Context Protocol (MCP) server for the Bring! shopping list API.
+A small [Model Context Protocol](https://modelcontextprotocol.io/) server for the Bring! shopping list API.
 
-## What it does
-
-This server exposes Bring! shopping list operations to MCP clients such as Claude Desktop or Cursor.
+It exposes Bring! shopping lists to MCP clients such as Claude Desktop, Cursor, or any client that can launch a stdio MCP server.
 
 ## Available tools
 
-- `get_lists` — list all shopping lists
-- `get_list` — fetch a single list with its items
-- `add_item` — add an item to a list
+- `get_lists` — list all Bring! shopping lists and their UUIDs
+- `get_list` — fetch one shopping list and show to-buy plus recently completed items
+- `add_item` — add or update an item on a list
 - `remove_item` — remove an item from a list
 - `complete_item` — move an item to Recently Purchased (complete it in Bring!)
-- `batch_update` — apply bulk operations (ADD, COMPLETE, or REMOVE) to multiple items
+- `batch_update` — apply bulk operations (`ADD`, `COMPLETE`, or `REMOVE`) to multiple items
 
-## APIs and dependencies
+## Requirements
 
-### External APIs / services
-
-- **Bring! Shopping List API** — used through the `bring-api` Python package
-- **MCP (Model Context Protocol)** — served via the `mcp` Python package
-- **aiohttp** — async HTTP client used by `bring-api`
-- **python-dotenv** — optional `.env` loading for local development
+- Python 3.11+
+- A Bring! account
+- Environment variables for your Bring! login
 
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+git clone https://github.com/arithmetic-zz/bring-mcp-server.git
+cd bring-mcp-server
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
 ## Configuration
@@ -46,11 +45,15 @@ BRING_EMAIL=your@email.com
 BRING_PASSWORD=your-password
 ```
 
+`.env` is ignored by Git. Do not commit real Bring! credentials.
+
 ## Run
 
 ```bash
 python server.py
 ```
+
+The server communicates over stdio, so it is normally launched by an MCP client instead of being run interactively.
 
 ## Claude Desktop integration
 
@@ -69,19 +72,24 @@ python server.py
 }
 ```
 
+If you use the virtual environment from the installation steps, set `command` to `/path/to/bring-mcp-server/.venv/bin/python`.
+
 ## Development
 
 ```bash
 python -m py_compile server.py
-python -m pytest tests/ -v
+python -m unittest discover -s tests -v
 ```
+
+GitHub Actions runs the same compile and unit-test checks on Python 3.11 and 3.12 for pushes and pull requests.
 
 ## Notes
 
 - The server keeps one authenticated Bring client per process and reuses the HTTP session.
+- `get_list` follows the current `bring-api` response shape: active items are under `purchase`, completed/recent items under `recently`.
 - `save_item` (used by `add_item`) is an upsert — adding an item that already exists updates it rather than creating a duplicate.
 - `complete_item` moves items to the "Recently Purchased" list; it does not check items off in place.
-- Errors are caught, logged, and translated into short user-facing messages.
+- Known Bring/API/input errors are caught, logged, and translated into short user-facing messages.
 
 ## License
 

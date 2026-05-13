@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Iterable
 from typing import Any
 
 import aiohttp
@@ -99,6 +100,58 @@ def _list_uuid(arguments: dict[str, Any]) -> str:
     if not value:
         raise ValueError("list_uuid is required")
     return str(value)
+
+
+def _item_value(item: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = item.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _normalize_items(items: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return Bring items as (to-buy, recently-completed) sections.
+
+    bring-api returns ``items`` as a mapping with ``purchase`` and ``recently``
+    lists. Older tests and some raw payloads may still hand us a flat list, so
+    keep that shape as a to-buy fallback.
+    """
+    if isinstance(items, dict):
+        purchase = items.get("purchase") or []
+        recently = items.get("recently") or []
+        return list(purchase), list(recently)
+
+    if isinstance(items, list):
+        return items, []
+
+    return [], []
+
+
+def _format_items(title: str, items: Iterable[dict[str, Any]]) -> list[str]:
+    lines = [title]
+    for item in items:
+        name = _item_value(item, "itemId", "name") or "?"
+        spec = _item_value(item, "spec", "specification")
+        item_uuid = _item_value(item, "uuid")
+        spec_text = f" ({spec})" if spec else ""
+        uuid_text = f" [UUID: {item_uuid}]" if item_uuid else ""
+        lines.append(f"• {name}{spec_text}{uuid_text}")
+    return lines
+
+
+async def _get_list_name(bring: Bring, list_uuid: str) -> str:
+    try:
+        response = await bring.load_lists()
+    except BringException:
+        logger.exception("Could not load Bring list names")
+        return list_uuid
+
+    for shopping_list in response.get("lists", []):
+        if shopping_list.get("listUuid") == list_uuid:
+            return shopping_list.get("name") or list_uuid
+
+    return list_uuid
 
 
 @SERVER.list_tools()
@@ -234,9 +287,8 @@ async def list_tools() -> list[Tool]:
 
 
 async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    bring = await get_bring_client()
-
     if name == "get_lists":
+        bring = await get_bring_client()
         response = await bring.load_lists()
         lists = response.get("lists", [])
         if not lists:
@@ -248,19 +300,21 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent
 
     if name == "get_list":
         list_uuid = _list_uuid(arguments)
+        bring = await get_bring_client()
         response = await bring.get_list(list_uuid)
-        items = response.get("items", [])
-        list_name = response.get("name", "Untitled list")
+        purchase_items, recently_items = _normalize_items(response.get("items"))
+        list_name = response.get("name") or await _get_list_name(bring, list_uuid)
 
-        if not items:
+        if not purchase_items and not recently_items:
             return _text(f"List '{list_name}': no items.")
 
         lines = [f"List: {list_name}", "-" * 40]
-        for item in items:
-            done = " ✓" if item.get("status") == "DONE" else ""
-            spec = f" ({item.get('spec', '')})" if item.get("spec") else ""
-            item_uuid = f" [UUID: {item.get('uuid', '')}]" if item.get("uuid") else ""
-            lines.append(f"• {item.get('itemId', '?')}{spec}{item_uuid}{done}")
+        if purchase_items:
+            lines.extend(_format_items("To buy:", purchase_items))
+        if recently_items:
+            if purchase_items:
+                lines.append("")
+            lines.extend(_format_items("Recently completed:", recently_items))
 
         return _text("\n".join(lines))
 
@@ -269,6 +323,7 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent
         item_id = _item_name(arguments)
         spec = arguments.get("spec") or ""
         item_uuid = arguments.get("uuid")
+        bring = await get_bring_client()
         await bring.save_item(list_uuid, item_id, spec, item_uuid)
         return _text(f"✓ Added or updated '{item_id}' in the list.")
 
@@ -276,6 +331,7 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent
         list_uuid = _list_uuid(arguments)
         item_id = _item_name(arguments)
         item_uuid = arguments.get("item_uuid")
+        bring = await get_bring_client()
         await bring.remove_item(list_uuid, item_id, item_uuid)
         return _text(f"✓ Removed '{item_id}' from the list.")
 
@@ -284,8 +340,9 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent
         item_id = _item_name(arguments)
         spec = arguments.get("spec") or ""
         item_uuid = arguments.get("item_uuid")
+        bring = await get_bring_client()
         await bring.complete_item(list_uuid, item_id, spec, item_uuid)
-        return _text(f"✓ Marked '{item_id}' as completed.")
+        return _text(f"✓ Moved '{item_id}' to Recently Purchased.")
 
     if name == "batch_update":
         list_uuid = _list_uuid(arguments)
@@ -296,6 +353,7 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent
         except KeyError as exc:
             raise ValueError(f"Unsupported batch operation: {operation_name}") from exc
 
+        bring = await get_bring_client()
         await bring.batch_update_list(list_uuid, items, operation)
         return _text(f"✓ Batch operation '{operation.name}' completed for {len(items)} item(s).")
 
@@ -307,6 +365,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     """Execute a tool and translate known Bring errors into user-friendly text."""
     try:
         return await execute_tool(name, dict(arguments or {}))
+    except ValueError as exc:
+        logger.info("Invalid request for tool '%s': %s", name, exc)
+        if str(exc) == "BRING_EMAIL and BRING_PASSWORD must be set":
+            return _text(f"Configuration error: {exc}")
+        return _text(f"Invalid request: {exc}")
     except BringAuthException:
         logger.exception("Bring authentication failed for tool '%s'", name)
         return _text("Authentication failed. Check BRING_EMAIL and BRING_PASSWORD.")
@@ -319,10 +382,6 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     except BringException:
         logger.exception("Bring API error for tool '%s'", name)
         return _text("Bring API error.")
-    except ValueError as exc:
-        # Credentials missing or invalid operation enum
-        logger.exception("Value error for tool '%s': %s", name, exc)
-        return _text(str(exc))
     except Exception:
         logger.exception("Unexpected error while handling tool '%s'", name)
         return _text("Unexpected server error.")
@@ -343,6 +402,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(main())
