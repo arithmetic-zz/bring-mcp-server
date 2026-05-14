@@ -13,6 +13,18 @@ It exposes Bring! shopping lists to MCP clients such as Claude Desktop, Cursor, 
 - `complete_item` — move an item to Recently Purchased (complete it in Bring!)
 - `batch_update` — apply bulk operations (`ADD`, `COMPLETE`, or `REMOVE`) to multiple items
 
+## Available resources
+
+- `bring://lists` — JSON index of every shopping list
+- `bring://lists/{listUuid}` — JSON contents of a single list (purchase + recently sections)
+
+Clients such as Claude Desktop expose these in their "attach resource" picker.
+
+## Available prompts
+
+- `meal_plan` — plan a meal and stage missing ingredients on a target list
+- `weekly_groceries` — draft a balanced weekly grocery list and stage it on a target list
+
 ## Requirements
 
 - Python 3.11+
@@ -50,7 +62,7 @@ BRING_PASSWORD=your-password
 ## Run
 
 ```bash
-python server.py
+python3 server.py
 ```
 
 The server communicates over stdio, so it is normally launched by an MCP client instead of being run interactively.
@@ -77,11 +89,11 @@ If you use the virtual environment from the installation steps, set `command` to
 ## Development
 
 ```bash
-python -m py_compile server.py
-python -m unittest discover -s tests -v
+python3 -m py_compile server.py
+python3 -m unittest discover -s tests -v
 ```
 
-GitHub Actions runs the same compile and unit-test checks on Python 3.11 and 3.12 for pushes and pull requests.
+GitHub Actions runs the same compile and unit-test checks on Python 3.11, 3.12, and 3.13 for pushes and pull requests.
 
 ## Notes
 
