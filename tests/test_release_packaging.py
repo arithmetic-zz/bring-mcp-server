@@ -51,3 +51,20 @@ class ReleasePackagingTests(TestCase):
     def test_invalid_release_tag_is_rejected(self):
         with self.assertRaises(ValueError):
             build_archive(Path("unused"), "../../private", "linux", "x86_64", Path("unused"))
+
+    def test_checksum_uses_lf_even_when_host_defaults_to_crlf(self):
+        write_text = Path.write_text
+
+        def windows_write_text(path, text, **kwargs):
+            kwargs.setdefault("newline", "\r\n")
+            return write_text(path, text, **kwargs)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "executable"
+            binary.write_bytes(b"test executable")
+            with patch.object(Path, "write_text", windows_write_text):
+                archive = build_archive(binary, "v1.1.1", "windows", "x86_64", root / "output")
+            checksum = archive.with_name(archive.name + ".sha256").read_bytes()
+            self.assertNotIn(b"\r", checksum)
+            self.assertTrue(checksum.endswith(b"\n"))

@@ -77,7 +77,7 @@ def build_archive(binary: Path, version: str, system: str, arch: str, output: Pa
                 packed.add(bundle, arcname=bundle.name, filter=executable_mode)
     with archive.open("rb") as source:
         digest = hashlib.file_digest(source, "sha256").hexdigest()
-    archive.with_name(archive.name + ".sha256").write_text(f"{digest}  {archive.name}\n", encoding="ascii")
+    archive.with_name(archive.name + ".sha256").write_text(f"{digest}  {archive.name}\n", encoding="ascii", newline="\n")
     return archive
 
 
