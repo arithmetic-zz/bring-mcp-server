@@ -2,7 +2,7 @@
 
 A small [Model Context Protocol](https://modelcontextprotocol.io/) server for the Bring! shopping list API.
 
-It exposes Bring! shopping lists to MCP clients such as Claude Desktop, Cursor, or any client that can launch a stdio MCP server.
+It exposes Bring! shopping lists to MCP clients such as Codex, Claude Desktop, Cursor, or any client that can launch a stdio MCP server.
 
 ## Available tools
 
@@ -85,6 +85,31 @@ The server communicates over stdio, so it is normally launched by an MCP client 
 ```
 
 If you use the virtual environment from the installation steps, set `command` to `/path/to/bring-mcp-server/.venv/bin/python`.
+
+## Codex integration
+
+After installing the dependencies, configure `BRING_EMAIL` and `BRING_PASSWORD` in the checkout's `.env` file. Register the server with the Codex CLI:
+
+```bash
+codex mcp add bring -- \
+  "/path/to/bring-mcp-server/.venv/bin/python" \
+  "/path/to/bring-mcp-server/server.py"
+```
+
+Replace `/path/to/bring-mcp-server` with your checkout's absolute path. The server loads the project's `.env`; no credentials need to be included in the command.
+
+Alternatively, add this entry to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.bring]
+command = "/path/to/bring-mcp-server/.venv/bin/python"
+args = ["/path/to/bring-mcp-server/server.py"]
+cwd = "/path/to/bring-mcp-server"
+```
+
+Use either method, then start a new Codex session or restart the IDE extension. Run `codex mcp list` to check registration and `/mcp` inside the Codex CLI to inspect active servers. Ask Codex to list your Bring! shopping lists to verify the connection.
+
+The CLI and IDE extension share this configuration. See the [official Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp) for more options.
 
 ## Development
 
