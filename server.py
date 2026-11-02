@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import (
+    CallToolResult,
     GetPromptResult,
     Prompt,
     PromptArgument,
@@ -221,12 +222,19 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional specification, for example 'low-fat'",
                     },
+                    "item_name": {"type": "string", "description": "Alias for item_id"},
+                    "item": {"type": "string", "description": "Alias for item_id"},
                     "item_uuid": {
                         "type": "string",
                         "description": "Optional UUID for the item",
                     },
                 },
-                "required": ["list_uuid", "item_id"],
+                "required": ["list_uuid"],
+                "anyOf": [
+                    {"required": ["item_id"]},
+                    {"required": ["item_name"]},
+                    {"required": ["item"]},
+                ],
             },
         ),
         Tool(
@@ -243,12 +251,19 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Item name or identifier",
                     },
+                    "item_name": {"type": "string", "description": "Alias for item_id"},
+                    "item": {"type": "string", "description": "Alias for item_id"},
                     "item_uuid": {
                         "type": "string",
                         "description": "Optional UUID of the item",
                     },
                 },
-                "required": ["list_uuid", "item_id"],
+                "required": ["list_uuid"],
+                "anyOf": [
+                    {"required": ["item_id"]},
+                    {"required": ["item_name"]},
+                    {"required": ["item"]},
+                ],
             },
         ),
         Tool(
@@ -269,12 +284,19 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional specification",
                     },
+                    "item_name": {"type": "string", "description": "Alias for item_id"},
+                    "item": {"type": "string", "description": "Alias for item_id"},
                     "item_uuid": {
                         "type": "string",
                         "description": "Optional UUID of the item",
                     },
                 },
-                "required": ["list_uuid", "item_id"],
+                "required": ["list_uuid"],
+                "anyOf": [
+                    {"required": ["item_id"]},
+                    {"required": ["item_name"]},
+                    {"required": ["item"]},
+                ],
             },
         ),
         Tool(
@@ -386,32 +408,32 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent
 
 
 @SERVER.call_tool()
-async def call_tool(name: str, arguments: Any) -> list[TextContent]:
+async def call_tool(name: str, arguments: Any) -> CallToolResult:
     """Execute a tool and translate known Bring errors into user-friendly text."""
     try:
-        return await execute_tool(name, dict(arguments or {}))
+        return CallToolResult(content=await execute_tool(name, dict(arguments or {})), isError=False)
     except ValueError as exc:
         logger.info("Invalid request for tool '%s': %s", name, exc)
         if str(exc) == "BRING_EMAIL and BRING_PASSWORD must be set":
-            return _text(f"Configuration error: {exc}")
-        return _text(f"Invalid request: {exc}")
+            return CallToolResult(content=_text(f"Configuration error: {exc}"), isError=True)
+        return CallToolResult(content=_text(f"Invalid request: {exc}"), isError=True)
     except BringAuthException:
         logger.exception("Bring authentication failed for tool '%s'", name)
         # Token may have expired; drop the cached client so the next call re-logs in.
         await close_bring_client()
-        return _text("Authentication failed. Check BRING_EMAIL and BRING_PASSWORD.")
+        return CallToolResult(content=_text("Authentication failed. Check BRING_EMAIL and BRING_PASSWORD."), isError=True)
     except BringRequestException:
         logger.exception("Bring API request failed for tool '%s'", name)
-        return _text("Bring API request failed.")
+        return CallToolResult(content=_text("Bring API request failed."), isError=True)
     except BringParseException:
         logger.exception("Bring API returned invalid data for tool '%s'", name)
-        return _text("Bring API returned invalid data.")
+        return CallToolResult(content=_text("Bring API returned invalid data."), isError=True)
     except BringException:
         logger.exception("Bring API error for tool '%s'", name)
-        return _text("Bring API error.")
+        return CallToolResult(content=_text("Bring API error."), isError=True)
     except Exception:
         logger.exception("Unexpected error while handling tool '%s'", name)
-        return _text("Unexpected server error.")
+        return CallToolResult(content=_text("Unexpected server error."), isError=True)
 
 
 # --- Resources ---------------------------------------------------------------
@@ -437,6 +459,10 @@ async def list_resources() -> list[Resource]:
     try:
         bring = await get_bring_client()
         lists = await _load_lists(bring)
+    except BringAuthException:
+        await close_bring_client()
+        logger.info("list_resources cleared invalid authentication; falling back to index-only", exc_info=True)
+        return resources
     except (ValueError, BringException, aiohttp.ClientError, OSError):
         logger.info("list_resources falling back to index-only", exc_info=True)
         return resources
@@ -473,32 +499,36 @@ async def list_resource_templates() -> list[ResourceTemplate]:
 @SERVER.read_resource()
 async def read_resource(uri: AnyUrl) -> str:
     """Return JSON content for ``bring://lists`` or ``bring://lists/{uuid}``."""
-    uri_str = str(uri).rstrip("/")
-    if uri_str == LISTS_INDEX_URI:
-        bring = await get_bring_client()
-        lists = await _load_lists(bring)
-        return json.dumps({"lists": lists}, ensure_ascii=False, indent=2)
+    try:
+        uri_str = str(uri).rstrip("/")
+        if uri_str == LISTS_INDEX_URI:
+            bring = await get_bring_client()
+            lists = await _load_lists(bring)
+            return json.dumps({"lists": lists}, ensure_ascii=False, indent=2)
 
-    prefix = f"{LISTS_INDEX_URI}/"
-    if uri_str.startswith(prefix):
-        list_uuid = uri_str[len(prefix):]
-        if not list_uuid:
-            raise ValueError("Missing list UUID in resource URI")
-        bring = await get_bring_client()
-        response = _as_dict(await bring.get_list(list_uuid))
-        list_name = response.get("name") or _cached_list_name(list_uuid)
-        purchase_items, recently_items = _normalize_items(response.get("items"))
-        payload = {
-            "listUuid": list_uuid,
-            "name": list_name,
-            "items": {
-                "purchase": purchase_items,
-                "recently": recently_items,
-            },
-        }
-        return json.dumps(payload, ensure_ascii=False, indent=2)
+        prefix = f"{LISTS_INDEX_URI}/"
+        if uri_str.startswith(prefix):
+            list_uuid = uri_str[len(prefix):]
+            if not list_uuid:
+                raise ValueError("Missing list UUID in resource URI")
+            bring = await get_bring_client()
+            response = _as_dict(await bring.get_list(list_uuid))
+            list_name = response.get("name") or _cached_list_name(list_uuid)
+            purchase_items, recently_items = _normalize_items(response.get("items"))
+            payload = {
+                "listUuid": list_uuid,
+                "name": list_name,
+                "items": {
+                    "purchase": purchase_items,
+                    "recently": recently_items,
+                },
+            }
+            return json.dumps(payload, ensure_ascii=False, indent=2)
 
-    raise ValueError(f"Unknown resource URI: {uri_str}")
+        raise ValueError(f"Unknown resource URI: {uri_str}")
+    except BringAuthException:
+        await close_bring_client()
+        raise
 
 
 # --- Prompts -----------------------------------------------------------------

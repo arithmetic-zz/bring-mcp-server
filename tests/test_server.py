@@ -115,11 +115,11 @@ class BringServerTests(IsolatedAsyncioTestCase):
             await server.call_tool("get_lists", {})
             result = await server.call_tool("get_list", {"list_uuid": "list-1"})
 
-        self.assertIn("List: Zuhause", result[0].text)
-        self.assertIn("To buy:", result[0].text)
-        self.assertIn("• Milk (low-fat) [UUID: item-1]", result[0].text)
-        self.assertIn("Recently Purchased:", result[0].text)
-        self.assertIn("• Bread (whole grain) [UUID: item-2]", result[0].text)
+        self.assertIn("List: Zuhause", result.content[0].text)
+        self.assertIn("To buy:", result.content[0].text)
+        self.assertIn("• Milk (low-fat) [UUID: item-1]", result.content[0].text)
+        self.assertIn("Recently Purchased:", result.content[0].text)
+        self.assertIn("• Bread (whole grain) [UUID: item-2]", result.content[0].text)
 
     async def test_get_list_cold_start_uses_uuid_when_cache_empty(self):
         """Without a prior get_lists, get_list must not refetch — render the UUID."""
@@ -139,7 +139,7 @@ class BringServerTests(IsolatedAsyncioTestCase):
             result = await server.call_tool("get_list", {"list_uuid": "list-1"})
 
         fake.load_lists.assert_not_awaited()
-        self.assertIn("List: list-1", result[0].text)
+        self.assertIn("List: list-1", result.content[0].text)
 
     async def test_get_list_accepts_bring_api_dataclasses(self):
         """bring-api 1.x returns dataclasses, not dicts — server must coerce them."""
@@ -164,10 +164,10 @@ class BringServerTests(IsolatedAsyncioTestCase):
             lists_result = await server.call_tool("get_lists", {})
             list_result = await server.call_tool("get_list", {"list_uuid": "list-1"})
 
-        self.assertIn("• Zuhause (UUID: list-1)", lists_result[0].text)
-        self.assertIn("List: Zuhause", list_result[0].text)
-        self.assertIn("• Milk (low-fat) [UUID: item-1]", list_result[0].text)
-        self.assertIn("• Bread [UUID: item-2]", list_result[0].text)
+        self.assertIn("• Zuhause (UUID: list-1)", lists_result.content[0].text)
+        self.assertIn("List: Zuhause", list_result.content[0].text)
+        self.assertIn("• Milk (low-fat) [UUID: item-1]", list_result.content[0].text)
+        self.assertIn("• Bread [UUID: item-2]", list_result.content[0].text)
 
     async def test_get_list_uses_cached_list_name_after_get_lists(self):
         """After get_lists populates the cache, get_list must not call load_lists again."""
@@ -183,7 +183,7 @@ class BringServerTests(IsolatedAsyncioTestCase):
             result = await server.call_tool("get_list", {"list_uuid": "list-1"})
 
         self.assertEqual(fake.load_lists.await_count, 1)  # not re-fetched
-        self.assertIn("Zuhause", result[0].text)
+        self.assertIn("Zuhause", result.content[0].text)
 
     async def test_remove_and_complete_use_dedicated_api_methods(self):
         fake = DummyBring(DummySession(), "ada.lovelace@example.com", "secret")
@@ -193,7 +193,7 @@ class BringServerTests(IsolatedAsyncioTestCase):
                 "remove_item",
                 {"list_uuid": "list-1", "item_id": "Milk", "item_uuid": "item-1"},
             )
-            self.assertIn("Removed 'Milk'", result[0].text)
+            self.assertIn("Removed 'Milk'", result.content[0].text)
             fake.remove_item.assert_awaited_once_with("list-1", "Milk", "item-1")
             fake.batch_update_list.assert_not_awaited()
 
@@ -201,7 +201,7 @@ class BringServerTests(IsolatedAsyncioTestCase):
                 "complete_item",
                 {"list_uuid": "list-1", "item_id": "Milk", "item_uuid": "item-1", "spec": "low-fat"},
             )
-            self.assertIn("Recently Purchased", result[0].text)
+            self.assertIn("Recently Purchased", result.content[0].text)
             fake.complete_item.assert_awaited_once_with("list-1", "Milk", "low-fat", "item-1")
 
     async def test_add_item_accepts_item_uuid_and_legacy_uuid(self):
@@ -247,14 +247,15 @@ class BringServerTests(IsolatedAsyncioTestCase):
     async def test_validation_errors_are_user_facing(self):
         result = await server.call_tool("add_item", {"list_uuid": "list-1"})
 
-        self.assertEqual(result[0].text, "Invalid request: item_id is required")
+        self.assertTrue(result.isError)
+        self.assertEqual(result.content[0].text, "Invalid request: item_id is required")
 
     async def test_missing_credentials_are_reported_as_configuration_error(self):
         with patch.dict(os.environ, {}, clear=True):
             result = await server.call_tool("get_lists", {})
 
         self.assertEqual(
-            result[0].text,
+            result.content[0].text,
             "Configuration error: BRING_EMAIL and BRING_PASSWORD must be set",
         )
 
@@ -269,7 +270,8 @@ class BringServerTests(IsolatedAsyncioTestCase):
 
         result = await server.call_tool("get_lists", {})
 
-        self.assertIn("Authentication failed", result[0].text)
+        self.assertTrue(result.isError)
+        self.assertIn("Authentication failed", result.content[0].text)
         self.assertIsNone(server._BRING_CLIENT)  # noqa: SLF001
         self.assertIsNone(server._BRING_SESSION)  # noqa: SLF001
 
