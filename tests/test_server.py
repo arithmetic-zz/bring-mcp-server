@@ -26,9 +26,12 @@ from bring_api.types import (  # noqa: E402
 class DummySession:
     def __init__(self, *_args, **_kwargs):
         self.closed = False
+        self.connector = _kwargs.get("connector")
 
     async def close(self):
         self.closed = True
+        if self.connector is not None:
+            await self.connector.close()
 
 
 class DummyBring:
@@ -92,6 +95,14 @@ class BringServerTests(IsolatedAsyncioTestCase):
         self.assertEqual(len(DummyBring.instances), 1)
         self.assertEqual(DummyBring.instances[0].login.await_count, 1)
         self.assertFalse(DummyBring.instances[0].session.closed)
+
+    async def test_get_bring_client_has_tls_roots_without_system_ca_files(self):
+        with patch.dict(os.environ, {"SSL_CERT_FILE": "/nonexistent-cert-file", "SSL_CERT_DIR": "/nonexistent-cert-dir"}), patch.object(server, "Bring", DummyBring), patch.object(server.aiohttp, "ClientSession", DummySession), patch.object(server.aiohttp, "TCPConnector") as connector:
+            connector.return_value.close = AsyncMock()
+            await server.get_bring_client()
+            connector.assert_called_once()
+            context = connector.call_args.kwargs["ssl"]
+            self.assertGreater(context.cert_store_stats()["x509_ca"], 0)
 
     async def test_get_list_formats_purchase_and_recently_sections(self):
         fake = DummyBring(DummySession(), "ada.lovelace@example.com", "secret")

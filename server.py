@@ -11,10 +11,14 @@ import dataclasses
 import json
 import logging
 import os
+import ssl
+import sys
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import aiohttp
+import certifi
 from bring_api import Bring
 from bring_api.bring import BringItemOperation
 from bring_api.exceptions import (
@@ -39,7 +43,13 @@ from mcp.types import (
 )
 from pydantic import AnyUrl
 
-load_dotenv()
+def _load_environment() -> None:
+    """Load local configuration beside the script or frozen executable."""
+    entrypoint = sys.executable if getattr(sys, "frozen", False) else __file__
+    load_dotenv(Path(entrypoint).resolve().parent / ".env")
+
+
+_load_environment()
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +79,9 @@ async def get_bring_client() -> Bring:
     async with _BRING_LOCK:
         if _BRING_CLIENT is None:
             email, password = _require_credentials()
-            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+            context = ssl.create_default_context(cafile=certifi.where())
+            connector = aiohttp.TCPConnector(ssl=context)
+            session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=30))
             client = Bring(session, email, password)
 
             try:

@@ -6,6 +6,7 @@
 - `tests/test_server.py` contains unit tests and fake Bring clients/sessions.
 - `tests/test_mcp_protocol.py` exercises MCP validation and responses through an in-memory client/server connection with mocked Bring access.
 - `requirements.txt` lists runtime dependencies; `.env.example` documents required credentials.
+- `bring-mcp-server.spec`, `requirements-build.txt` and `scripts/` build, package and smoke-test standalone downloads; `.github/workflows/release.yml` publishes them after all four targets pass.
 - `.github/workflows/tests.yml` runs CI checks. `README.md` covers setup; this file is the shared contributor and agent guide.
 
 ## Build, Test, and Development Commands
@@ -20,7 +21,8 @@ python3 -m venv .venv
 
 Configure credentials before starting the server. It communicates over stdio and is normally launched by an MCP client.
 
-- `.venv/bin/python -m py_compile server.py` — check syntax; there is no separate build step.
+- `.venv/bin/python -m py_compile server.py` — check source syntax.
+- `.venv/bin/python -m PyInstaller --noconfirm --clean bring-mcp-server.spec` — build a standalone executable after installing `requirements-build.txt`.
 - `.venv/bin/python -m unittest discover -s tests -v` — run the unit suite.
 - `npx @modelcontextprotocol/inspector .venv/bin/python server.py` — inspect MCP tools, resources, and prompts interactively.
 
@@ -54,3 +56,5 @@ The available local history uses imperative subjects, for example `Add MCP resou
 ## Security & Configuration
 
 Copy `.env.example` to `.env` and set `BRING_EMAIL` and `BRING_PASSWORD`. Keep `.env` ignored; never commit real credentials or include them in logs, fixtures, or PR examples.
+
+Source runs load `.env` beside `server.py`; frozen downloads load it beside `sys.executable`. Packaging must keep an explicit public-file allowlist and include Bring locale data and third-party licenses. Never bundle `.env`, logs or local configuration. Release executables use no developer signing certificate or notarization.

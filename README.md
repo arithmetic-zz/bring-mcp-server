@@ -27,7 +27,30 @@ Clients such as Claude Desktop expose these in their "attach resource" picker.
 - `meal_plan` — plan a meal and stage missing ingredients on a target list
 - `weekly_groceries` — draft a balanced weekly grocery list and stage it on a target list
 
-## Requirements
+## Download a standalone executable
+
+Download the archive for your system from [GitHub Releases](https://github.com/arithmetic-zz/bring-mcp-server/releases/latest). These bundles include Python and the dependencies; no Python installation or `pip` setup is required.
+
+| Download suffix | Target |
+| --- | --- |
+| `macos-arm64.tar.gz` | macOS 15+ on Apple Silicon |
+| `macos-x86_64.tar.gz` | macOS 15+ on Intel |
+| `linux-x86_64.tar.gz` | Ubuntu 22.04+ or compatible glibc-based Linux |
+| `windows-x86_64.zip` | Windows 10/11, 64-bit Intel/AMD |
+
+Extract the archive into a permanent folder, copy `.env.example` to `.env` beside `bring-mcp-server` (or `bring-mcp-server.exe` on Windows), and enter your Bring! credentials. Existing environment variables take precedence. `SHA256SUMS` provides checksums for the archives.
+
+The downloads have no Developer ID/Authenticode signing or macOS notarization. macOS or Windows may ask you to explicitly approve the executable. The automatic tests cover MCP startup and protocol behavior on the build runners; verify live Bring access on your own machine.
+
+For Codex, register the executable directly:
+
+```bash
+codex mcp add bring -- "/absolute/path/to/bring-mcp-server"
+```
+
+On Windows, use the full path to `bring-mcp-server.exe`. For Claude Desktop, set `command` to the executable's absolute path and `args` to `[]`. Keep `.env` beside the executable, not in the client's working directory.
+
+## Requirements for running from source
 
 - Python 3.11+
 - A Bring! account
@@ -66,7 +89,7 @@ BRING_PASSWORD=your-password
 
 `.env` is ignored by Git. Do not commit real Bring! credentials.
 
-The server loads `.env` from the project directory even when launched by a client from another working directory. Existing environment variables take precedence over `.env` values.
+When running from source, the server loads `.env` beside `server.py`, even when launched from another working directory. Standalone downloads load it beside the executable. Existing environment variables take precedence over `.env` values.
 
 ## Run
 
@@ -141,6 +164,21 @@ npx @modelcontextprotocol/inspector .venv/bin/python server.py
 With valid credentials, verify `get_lists` and `get_list` first. On a chosen list, add uniquely named test items using `add_item` or `batch_update` (`ADD`), read them back, then delete them with `remove_item` and confirm they are absent. These calls modify real Bring data; clean up only the items created for the test.
 
 Contributor conventions and architecture details are in [AGENTS.md](AGENTS.md).
+
+## Building release downloads
+
+Build on the target OS and architecture:
+
+```bash
+.venv/bin/python -m pip install -r requirements-build.txt
+.venv/bin/python -m PyInstaller --noconfirm --clean bring-mcp-server.spec
+.venv/bin/python scripts/package_release.py --binary dist/bring-mcp-server --version v1.1.1 --system macos --arch arm64
+.venv/bin/python scripts/smoke_test.py --archive dist/release/bring-mcp-server-v1.1.1-macos-arm64.tar.gz
+```
+
+Adjust the version, system (`macos`, `linux`, `windows`), architecture and executable suffix for your target. The package contains the executable, this README, `.env.example`, the project license and third-party license texts. The real `.env` is never included.
+
+The `Release binaries` workflow builds all four targets when a `v*` tag is pushed. It can also be run manually for an existing version tag. Every target runs the source tests and an MCP smoke test against its extracted archive. The release is published with downloads and checksums only after all targets succeed. Publishing expects that the version has no existing GitHub Release; it does not overwrite releases or move tags.
 
 ## Notes
 
