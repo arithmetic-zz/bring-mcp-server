@@ -68,8 +68,13 @@ def build_archive(binary: Path, version: str, system: str, arch: str, output: Pa
                     if file.is_file():
                         packed.write(file, file.relative_to(bundle.parent))
         else:
+            def executable_mode(member: tarfile.TarInfo) -> tarfile.TarInfo:
+                if member.name == f"{bundle.name}/{executable.name}":
+                    member.mode = 0o755
+                return member
+
             with tarfile.open(archive, "w:gz") as packed:
-                packed.add(bundle, arcname=bundle.name)
+                packed.add(bundle, arcname=bundle.name, filter=executable_mode)
     with archive.open("rb") as source:
         digest = hashlib.file_digest(source, "sha256").hexdigest()
     archive.with_name(archive.name + ".sha256").write_text(f"{digest}  {archive.name}\n", encoding="ascii")

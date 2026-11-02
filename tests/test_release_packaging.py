@@ -21,7 +21,8 @@ class ReleasePackagingTests(TestCase):
                 (root / name).write_text("PRIVATE_TEST_SENTINEL")
             binary = root / "fake-executable"
             binary.write_bytes(b"test executable")
-            with patch("scripts.package_release.ROOT", root):
+            # Windows ignores POSIX executable bits when chmod is called.
+            with patch("scripts.package_release.ROOT", root), patch.object(Path, "chmod"):
                 for system in ("linux", "macos", "windows"):
                     with self.subTest(system=system):
                         archive = build_archive(binary, "v1.1.1", system, "x86_64", root / "output")
