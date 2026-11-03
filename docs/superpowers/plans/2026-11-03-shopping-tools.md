@@ -18,7 +18,8 @@
 - [x] Add failing tests for created/updated, UUID selection, duplicate names and recent items; implement and run suite.
 - [x] Update descriptions, README, contributor guidance and combined v1.2.0 release notes.
 - [x] Run syntax, unit/protocol, dependency checks and independent branch review; fix findings.
-- [ ] Push feature branch and PR closing #1–#5; wait for green CI and user acceptance.
+- [x] Push feature branch and PR #6 closing #1–#5; implementation CI passed on Python 3.11/3.12/3.13.
+- [ ] Obtain user acceptance of PR #6.
 - [ ] Merge accepted PR, tag v1.2.0, verify four release builds and published assets/notes; audit issue closure.
 
 ## Review focus
