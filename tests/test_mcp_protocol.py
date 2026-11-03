@@ -78,10 +78,12 @@ class McpProtocolTests(IsolatedAsyncioTestCase):
         self.bring.get_list.assert_not_awaited()
 
     async def test_item_name_aliases_pass_mcp_validation(self):
+        self.bring.get_list.return_value = {"items": {
+            "purchase": [{"itemId": "Milk", "uuid": "milk"}], "recently": []}}
         for tool, method, tail in (
-            ("add_item", "save_item", ("", None)),
-            ("remove_item", "remove_item", (None,)),
-            ("complete_item", "complete_item", ("", None)),
+            ("add_item", "save_item", ("", "milk")),
+            ("remove_item", "remove_item", ("milk",)),
+            ("complete_item", "complete_item", ("", "milk")),
         ):
             for key in ("item_id", "item_name", "item"):
                 with self.subTest(tool=tool, key=key):
@@ -92,6 +94,8 @@ class McpProtocolTests(IsolatedAsyncioTestCase):
                     mock.assert_awaited_once_with("list-1", "Milk", *tail)
 
     async def test_canonical_item_name_takes_precedence(self):
+        self.bring.get_list.return_value = {"items": {"purchase": [
+            {"itemId": "Milk", "uuid": "milk"}, {"itemId": "Bread", "uuid": "bread"}], "recently": []}}
         for arguments, expected in (
             ({"item_id": "Milk", "item_name": "Bread", "item": "Eggs"}, "Milk"),
             ({"item_name": "Bread", "item": "Eggs"}, "Bread"),
@@ -100,7 +104,7 @@ class McpProtocolTests(IsolatedAsyncioTestCase):
                 self.bring.save_item.reset_mock()
                 result = await self.invoke("add_item", {"list_uuid": "list-1", **arguments})
                 self.assertFalse(result.isError)
-                self.bring.save_item.assert_awaited_once_with("list-1", expected, "", None)
+                self.bring.save_item.assert_awaited_once_with("list-1", expected, "", expected.lower())
 
     async def test_missing_or_empty_item_name_is_rejected(self):
         for tool in ("add_item", "remove_item", "complete_item"):
@@ -203,3 +207,53 @@ class McpProtocolTests(IsolatedAsyncioTestCase):
                 await client.read_resource("bring://other/thing")
         self.bring.load_lists.assert_not_awaited()
         self.bring.get_list.assert_not_awaited()
+
+    async def test_list_name_and_json_options_over_protocol(self):
+        self.bring.load_lists.return_value = {"lists": [{"listUuid": "home", "name": "Home"}]}
+        self.bring.get_list.return_value = {"items": {
+            "purchase": [{"itemId": "Milk", "uuid": "milk"}],
+            "recently": [{"itemId": "Bread", "uuid": "bread"}]}}
+        for tool, extra in (
+            ("get_list", {"format": "json", "include_recent": False}),
+            ("add_item", {"item": "Milk"}), ("remove_item", {"item_name": "Milk"}),
+            ("complete_item", {"item_id": "Milk"}),
+            ("batch_update", {"items": [{"itemId": "Eggs"}], "operation": "ADD"}),
+        ):
+            with self.subTest(tool=tool):
+                result = await self.invoke(tool, {"list_name": "Home", **extra})
+                self.assertFalse(result.isError, result.content)
+                if tool == "get_list":
+                    data = json.loads(result.content[0].text)
+                    self.assertEqual(data["items"]["recently"], [])
+                    self.assertEqual(data["items"]["purchase"][0]["uuid"], "milk")
+                elif tool != "batch_update":
+                    self.assertEqual(result.structuredContent["item_uuid"], "milk")
+                    self.assertEqual(result.structuredContent["list_uuid"], "home")
+        self.bring.load_lists.assert_awaited_once()
+
+    async def test_invalid_list_selectors_and_options_over_protocol(self):
+        for arguments in ({}, {"list_name": ""}, {"list_uuid": ""},
+                          {"list_name": 123}, {"list_uuid": "home", "include_recent": "false"},
+                          {"list_uuid": "home", "format": "xml"}):
+            with self.subTest(arguments=arguments):
+                result = await self.invoke("get_list", arguments)
+                self.assertTrue(result.isError)
+        self.bring.get_list.assert_not_awaited()
+
+    async def test_added_lookup_auth_failure_invalidates_caches(self):
+        for tool, arguments, lookup in (
+            ("get_list", {"list_name": "Home"}, "load_lists"),
+            ("get_list", {"list_uuid": "home"}, "load_lists"),
+            ("add_item", {"list_uuid": "home", "item_id": "Milk"}, "get_list"),
+        ):
+            with self.subTest(tool=tool, arguments=arguments):
+                await server.close_bring_client()
+                self.bring = await server.get_bring_client()
+                getattr(self.bring, lookup).side_effect = BringAuthException("expired")
+                with self.assertLogs(server.logger, level="ERROR"):
+                    result = await self.invoke(tool, arguments)
+                self.assertTrue(result.isError)
+                self.assertIsNone(server._BRING_CLIENT)
+                self.assertEqual(server._LIST_NAME_CACHE, {})
+                self.assertTrue(self.bring.session.closed)
+                self.bring.save_item.assert_not_awaited()

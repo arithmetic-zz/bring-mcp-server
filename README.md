@@ -7,13 +7,52 @@ It exposes Bring! shopping lists to MCP clients such as Codex, Claude Desktop, C
 ## Available tools
 
 - `get_lists` — list all Bring! shopping lists and their UUIDs
-- `get_list` — fetch one shopping list and show to-buy plus recently completed items
-- `add_item` — add or update an item on a list
-- `remove_item` — remove an item from a list
-- `complete_item` — move an item to Recently Purchased (complete it in Bring!)
+- `get_list` — fetch one shopping list as text or JSON, optionally hiding Recently Purchased
+- `add_item` — add or update an item; return `created`/`updated` and its UUID
+- `remove_item` — delete an item completely from a list; return its UUID
+- `complete_item` — move an item to Recently Purchased, rather than checking it off in place; return its UUID
 - `batch_update` — apply bulk operations (`ADD`, `COMPLETE`, or `REMOVE`) to multiple items
 
 Single-item tools accept `item_id` (preferred), `item_name`, or `item` for the item name, in that order of precedence. Tool failures return a short message with the MCP `isError` flag set to `true`.
+
+### Select a list and read its contents
+
+All list-specific tools accept either `list_uuid` or the exact, case-sensitive `list_name`. At least one is required; `list_uuid` takes precedence when both are supplied. Names are cached after discovery. A name miss refreshes the cache once; unknown names report the available names, and duplicate names require a UUID. If a list was renamed, call `get_lists` to refresh cached names.
+
+`get_list` defaults to the existing text output with both **To buy** and **Recently Purchased** sections. Set `include_recent` to `false` to omit history, or `format` to `"json"` for the same JSON shape as `bring://lists/{listUuid}`. Both options can be combined:
+
+```json
+{"list_name": "Home", "format": "json", "include_recent": false}
+```
+
+Example tool JSON response:
+
+```json
+{
+  "listUuid": "list-1",
+  "name": "Home",
+  "items": {
+    "purchase": [{"itemId": "Milk", "specification": "2 l", "uuid": "item-1"}],
+    "recently": []
+  }
+}
+```
+
+`purchase` contains open items; `recently` is purchase history. Filtering history leaves `recently` as an empty array in JSON. A cold read lazily fetches list names once; a cached name avoids that extra request.
+
+### Add, remove and complete items
+
+`add_item` is an upsert: a matching existing item is updated; a new item is added. `complete_item` moves the item to **Recently Purchased**; it does not check it off in place. `remove_item` deletes it completely. Batch `ADD`, `COMPLETE` and `REMOVE` have the same respective semantics.
+
+Single-item changes retain a readable first text block and add a JSON text block, also available as MCP `structuredContent`:
+
+```json
+{"list_uuid": "list-1", "item_id": "Milk", "item_uuid": "item-1", "status": "updated"}
+```
+
+For `add_item`, `status` is `updated` when the target UUID was already in `purchase`, otherwise `created` (including re-adding an item from history). Removal returns `removed`; completion returns `completed`. These statuses describe the state read immediately before the write; simultaneous edits by other Bring clients are not atomic with this check.
+
+The server reads the items once before a single-item change, reuses an existing UUID, or assigns a new UUID when adding/completing a new item. Specify `item_uuid` to select among duplicate names or to create a separate same-name item with a new UUID. Name-only changes reject ambiguous matches across open items and history rather than choosing an arbitrary item. Removing an unknown name reports an error. `add_item` also accepts legacy `uuid`; `item_uuid` takes precedence. An item-name argument remains required even when a UUID is supplied.
 
 ## Available resources
 
@@ -172,8 +211,8 @@ Build on the target OS and architecture:
 ```bash
 .venv/bin/python -m pip install -r requirements-build.txt
 .venv/bin/python -m PyInstaller --noconfirm --clean bring-mcp-server.spec
-.venv/bin/python scripts/package_release.py --binary dist/bring-mcp-server --version v1.1.1 --system macos --arch arm64
-.venv/bin/python scripts/smoke_test.py --archive dist/release/bring-mcp-server-v1.1.1-macos-arm64.tar.gz
+.venv/bin/python scripts/package_release.py --binary dist/bring-mcp-server --version v1.2.0 --system macos --arch arm64
+.venv/bin/python scripts/smoke_test.py --archive dist/release/bring-mcp-server-v1.2.0-macos-arm64.tar.gz
 ```
 
 Adjust the version, system (`macos`, `linux`, `windows`), architecture and executable suffix for your target. The package contains the executable, this README, `.env.example`, the project license and third-party license texts. The real `.env` is never included.

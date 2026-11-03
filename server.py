@@ -16,6 +16,7 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import aiohttp
 import certifi
@@ -120,11 +121,22 @@ def _item_name(arguments: dict[str, Any]) -> str:
     return str(value)
 
 
-def _list_uuid(arguments: dict[str, Any]) -> str:
-    value = arguments.get("list_uuid")
-    if not value:
-        raise ValueError("list_uuid is required")
-    return str(value)
+async def _resolve_list_uuid(arguments: dict[str, Any]) -> str:
+    if arguments.get("list_uuid"):
+        return str(arguments["list_uuid"])
+    name = arguments.get("list_name")
+    if not name:
+        raise ValueError("list_uuid or list_name is required")
+    matches = [uuid for uuid, cached in _LIST_NAME_CACHE.items() if cached == name]
+    if not matches:
+        await _load_lists(await get_bring_client())
+        matches = [uuid for uuid, cached in _LIST_NAME_CACHE.items() if cached == name]
+    if len(matches) > 1:
+        raise ValueError(f"Multiple lists named '{name}'; use list_uuid.")
+    if not matches:
+        available = ", ".join(sorted(set(_LIST_NAME_CACHE.values()))) or "(none)"
+        raise ValueError(f"Unknown list name '{name}'. Available lists: {available}")
+    return matches[0]
 
 
 def _as_dict(value: Any) -> Any:
@@ -183,20 +195,55 @@ async def _load_lists(bring: Bring) -> list[dict[str, Any]]:
 
 
 def _cached_list_name(list_uuid: str) -> str:
-    """Return the cached list name, or the UUID if it has not been seen yet.
-
-    Why: ``BringItemsResponse`` has no ``name`` field, so we used to refresh
-    list names from the API on every ``get_list`` call. That doubled the HTTP
-    traffic on a cold start. Instead we only render the name when the cache
-    has been warmed by a previous ``get_lists`` / ``_load_lists`` call.
-    """
+    """Return a name or UUID without fetching; callers can warm the cache."""
     return _LIST_NAME_CACHE.get(list_uuid, list_uuid)
+
+
+async def _get_list_payload(bring: Bring, list_uuid: str) -> dict[str, Any]:
+    response = _as_dict(await bring.get_list(list_uuid))
+    if not response.get("name") and list_uuid not in _LIST_NAME_CACHE:
+        await _load_lists(bring)
+    purchase, recently = _normalize_items(response.get("items"))
+    return {
+        "listUuid": list_uuid,
+        "name": response.get("name") or _cached_list_name(list_uuid),
+        "items": {"purchase": purchase, "recently": recently},
+    }
+
+
+async def _mutation_target(
+    bring: Bring, list_uuid: str, item_id: str, item_uuid: str | None, operation: str
+) -> tuple[str, bool]:
+    """Resolve an unambiguous UUID and whether it is currently on the buy list."""
+    response = _as_dict(await bring.get_list(list_uuid))
+    purchase, recently = _normalize_items(response.get("items"))
+    all_items = purchase + recently
+    if item_uuid:
+        return item_uuid, any(_item_value(item, "uuid") == item_uuid for item in purchase)
+    matches = [item for item in all_items if _item_value(item, "itemId", "name") == item_id]
+    # A UUID may occur in both sections during transitions; it is still one item.
+    ids = {_item_value(item, "uuid") for item in matches}
+    if len(ids) > 1 or (len(matches) > 1 and "" in ids):
+        raise ValueError(f"Multiple items named '{item_id}'; use item_uuid.")
+    if matches:
+        resolved = _item_value(matches[0], "uuid")
+        if not resolved:
+            raise ValueError(f"Item '{item_id}' has no UUID; refresh the list before retrying.")
+        return resolved, any(_item_value(item, "uuid") == resolved for item in purchase)
+    if operation == "remove_item":
+        raise ValueError(f"Item '{item_id}' not found; supply item_uuid if known.")
+    return str(uuid4()), False
+
+
+def _mutation_result(message: str, list_uuid: str, item_id: str, item_uuid: str, status: str) -> list[TextContent]:
+    payload = {"list_uuid": list_uuid, "item_id": item_id, "item_uuid": item_uuid, "status": status}
+    return _text(message) + _text(json.dumps(payload, ensure_ascii=False))
 
 
 @SERVER.list_tools()
 async def list_tools() -> list[Tool]:
     """Return all available tools."""
-    return [
+    tools = [
         Tool(
             name="get_lists",
             description="List all Bring! shopping lists.",
@@ -204,21 +251,23 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_list",
-            description="Return a single Bring! shopping list with its items.",
+            description="Return a single Bring! shopping list. Defaults to text with Recently Purchased; use format=json for structured sections or include_recent=false to hide history.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "list_uuid": {
                         "type": "string",
                         "description": "UUID of the shopping list",
-                    }
+                    },
+                    "format": {"type": "string", "enum": ["text", "json"], "default": "text"},
+                    "include_recent": {"type": "boolean", "default": True},
                 },
                 "required": ["list_uuid"],
             },
         ),
         Tool(
             name="add_item",
-            description="Add an item to a shopping list.",
+            description="Add an item, or update it if it already exists. Returns created/updated status and item_uuid. Duplicate names require item_uuid.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -251,7 +300,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="remove_item",
-            description="Remove an item from a shopping list.",
+            description="Delete an item completely from the list, rather than checking it off. Returns item_uuid; duplicate names require item_uuid.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -280,7 +329,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="complete_item",
-            description="Mark an item as completed.",
+            description="Move an item to Recently Purchased; it is not checked off in place. Returns item_uuid; duplicate names require item_uuid.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -313,7 +362,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="batch_update",
-            description="Apply a batch operation to multiple items.",
+            description="Apply ADD (add or update), COMPLETE (move to Recently Purchased, not check off in place), or REMOVE (delete completely) to multiple items.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -345,6 +394,20 @@ async def list_tools() -> list[Tool]:
         ),
     ]
 
+    for tool in tools:
+        if tool.name == "get_lists":
+            continue
+        schema = tool.inputSchema
+        schema["properties"]["list_name"] = {
+            "type": "string", "minLength": 1,
+            "description": "Exact list name, as an alternative to list_uuid; UUID takes precedence.",
+        }
+        schema["properties"]["list_uuid"]["minLength"] = 1
+        schema["required"] = [key for key in schema.get("required", []) if key != "list_uuid"]
+        schema["allOf"] = [{"anyOf": [{"required": ["list_uuid"]}, {"required": ["list_name"]}]}]
+        tool.description += " Select the list by list_uuid or list_name (UUID takes precedence)."
+    return tools
+
 
 async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     if name == "get_lists":
@@ -358,11 +421,22 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent
         return _text("\n".join(lines))
 
     if name == "get_list":
-        list_uuid = _list_uuid(arguments)
+        list_uuid = await _resolve_list_uuid(arguments)
         bring = await get_bring_client()
-        response = _as_dict(await bring.get_list(list_uuid))
-        purchase_items, recently_items = _normalize_items(response.get("items"))
-        list_name = response.get("name") or _cached_list_name(list_uuid)
+        output_format = arguments.get("format", "text")
+        include_recent = arguments.get("include_recent", True)
+        if output_format not in ("text", "json"):
+            raise ValueError("format must be text or json")
+        if not isinstance(include_recent, bool):
+            raise ValueError("include_recent must be a boolean")
+        payload = await _get_list_payload(bring, list_uuid)
+        if not include_recent:
+            payload["items"]["recently"] = []
+        if output_format == "json":
+            return _text(json.dumps(payload, ensure_ascii=False, indent=2))
+        purchase_items = payload["items"]["purchase"]
+        recently_items = payload["items"]["recently"]
+        list_name = payload["name"]
 
         if not purchase_items and not recently_items:
             return _text(f"List '{list_name}': no items.")
@@ -377,34 +451,31 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent
 
         return _text("\n".join(lines))
 
-    if name == "add_item":
-        list_uuid = _list_uuid(arguments)
+    if name in ("add_item", "remove_item", "complete_item"):
+        list_uuid = await _resolve_list_uuid(arguments)
         item_id = _item_name(arguments)
         spec = arguments.get("spec") or ""
-        item_uuid = arguments.get("item_uuid") or arguments.get("uuid")
+        supplied_uuid = arguments.get("item_uuid")
+        if name == "add_item":
+            supplied_uuid = supplied_uuid or arguments.get("uuid")
         bring = await get_bring_client()
-        await bring.save_item(list_uuid, item_id, spec, item_uuid)
-        return _text(f"✓ Added or updated '{item_id}' in the list.")
-
-    if name == "remove_item":
-        list_uuid = _list_uuid(arguments)
-        item_id = _item_name(arguments)
-        item_uuid = arguments.get("item_uuid")
-        bring = await get_bring_client()
-        await bring.remove_item(list_uuid, item_id, item_uuid)
-        return _text(f"✓ Removed '{item_id}' from the list.")
-
-    if name == "complete_item":
-        list_uuid = _list_uuid(arguments)
-        item_id = _item_name(arguments)
-        spec = arguments.get("spec") or ""
-        item_uuid = arguments.get("item_uuid")
-        bring = await get_bring_client()
-        await bring.complete_item(list_uuid, item_id, spec, item_uuid)
-        return _text(f"✓ Moved '{item_id}' to Recently Purchased.")
+        item_uuid, existed = await _mutation_target(bring, list_uuid, item_id, supplied_uuid, name)
+        if name == "add_item":
+            await bring.save_item(list_uuid, item_id, spec, item_uuid)
+            status = "updated" if existed else "created"
+            message = f"✓ {'Updated' if existed else 'Added'} '{item_id}' in the list."
+        elif name == "remove_item":
+            await bring.remove_item(list_uuid, item_id, item_uuid)
+            status = "removed"
+            message = f"✓ Removed '{item_id}' from the list."
+        else:
+            await bring.complete_item(list_uuid, item_id, spec, item_uuid)
+            status = "completed"
+            message = f"✓ Moved '{item_id}' to Recently Purchased."
+        return _mutation_result(message, list_uuid, item_id, item_uuid, status)
 
     if name == "batch_update":
-        list_uuid = _list_uuid(arguments)
+        list_uuid = await _resolve_list_uuid(arguments)
         items = arguments.get("items", [])
         operation_name = str(arguments.get("operation", "ADD")).upper()
         try:
@@ -423,7 +494,9 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent
 async def call_tool(name: str, arguments: Any) -> CallToolResult:
     """Execute a tool and translate known Bring errors into user-friendly text."""
     try:
-        return CallToolResult(content=await execute_tool(name, dict(arguments or {})), isError=False)
+        content = await execute_tool(name, dict(arguments or {}))
+        metadata = json.loads(content[1].text) if name in ("add_item", "remove_item", "complete_item") else None
+        return CallToolResult(content=content, structuredContent=metadata, isError=False)
     except ValueError as exc:
         logger.info("Invalid request for tool '%s': %s", name, exc)
         if str(exc) == "BRING_EMAIL and BRING_PASSWORD must be set":
@@ -524,17 +597,7 @@ async def read_resource(uri: AnyUrl) -> str:
             if not list_uuid:
                 raise ValueError("Missing list UUID in resource URI")
             bring = await get_bring_client()
-            response = _as_dict(await bring.get_list(list_uuid))
-            list_name = response.get("name") or _cached_list_name(list_uuid)
-            purchase_items, recently_items = _normalize_items(response.get("items"))
-            payload = {
-                "listUuid": list_uuid,
-                "name": list_name,
-                "items": {
-                    "purchase": purchase_items,
-                    "recently": recently_items,
-                },
-            }
+            payload = await _get_list_payload(bring, list_uuid)
             return json.dumps(payload, ensure_ascii=False, indent=2)
 
         raise ValueError(f"Unknown resource URI: {uri_str}")

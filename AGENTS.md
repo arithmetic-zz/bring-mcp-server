@@ -36,9 +36,9 @@ Keep logging configuration inside `main()` so imports do not override the test r
 
 - Keep `mcp<2` until the server is migrated: MCP 2 removes the handler decorators used here.
 - Reuse `get_bring_client()`: it caches the authenticated client/session under `_BRING_LOCK`. Close through `close_bring_client()` on shutdown and authentication failure so the next call logs in again.
-- Convert API dataclasses through `_as_dict()` before dictionary access. `_load_lists()` refreshes `_LIST_NAME_CACHE`; `_cached_list_name()` returns a name or UUID without fetching. Closing the client clears the cache.
-- Keep `list_tools()` schemas aligned with `execute_tool()`, including argument aliases. `call_tool()` returns `CallToolResult`: friendly `TextContent` with `isError=True` on failure, `False` on success.
-- Preserve `_item_name()` aliases (`item_id`, `item_name`, `item`), `add_item`'s canonical `item_uuid` and legacy `uuid`, and required `list_uuid`.
+- Convert API dataclasses through `_as_dict()` before dictionary access. `_load_lists()` refreshes `_LIST_NAME_CACHE`; `_cached_list_name()` returns a name or UUID without fetching. `_get_list_payload()` lazily warms missing names and shares the tool/resource JSON shape. Closing the client clears the cache.
+- Keep `list_tools()` schemas aligned with `execute_tool()`, including argument aliases. `call_tool()` returns `CallToolResult`: friendly `TextContent` with `isError=True` on failure, `False` on success. Single-item mutations include a second JSON text block and matching `structuredContent` with status and UUID.
+- Preserve `_item_name()` aliases (`item_id`, `item_name`, `item`), `add_item`'s canonical `item_uuid` and legacy `uuid`, and `list_uuid` precedence over the alternative exact `list_name`. Require at least one list selector; reject ambiguous names.
 - Map batch operations (`ADD`, `COMPLETE`, `REMOVE`) to `BringItemOperation`. Single-item removal/completion must use dedicated client methods.
 - Resources expose `bring://lists` and `bring://lists/{listUuid}`. Discovery must fall back to the index without credentials/network; unknown resource reads raise `ValueError`. Tool and resource authentication failures must clear client/session/name caches before the next request.
 - Keep `meal_plan` and `weekly_groceries` prompts explicit: call `get_list` before `batch_update` with `ADD`.
