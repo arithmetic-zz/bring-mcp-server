@@ -132,8 +132,8 @@ class BringServerTests(IsolatedAsyncioTestCase):
         self.assertIn("Recently Purchased:", result.content[0].text)
         self.assertIn("• Bread (whole grain) [UUID: item-2]", result.content[0].text)
 
-    async def test_get_list_cold_start_uses_uuid_when_cache_empty(self):
-        """Without a prior get_lists, get_list must not refetch — render the UUID."""
+    async def test_get_list_cold_start_loads_name_once(self):
+        """Cold reads lazily fetch names once, without per-item lookups."""
         fake = DummyBring(DummySession(), "ada.lovelace@example.com", "secret")
         fake.load_lists = AsyncMock(return_value={"lists": [{"name": "Zuhause", "listUuid": "list-1"}]})
         fake.get_list = AsyncMock(
@@ -149,8 +149,8 @@ class BringServerTests(IsolatedAsyncioTestCase):
         with patch.object(server, "get_bring_client", AsyncMock(return_value=fake)):
             result = await server.call_tool("get_list", {"list_uuid": "list-1"})
 
-        fake.load_lists.assert_not_awaited()
-        self.assertIn("List: list-1", result.content[0].text)
+        fake.load_lists.assert_awaited_once()
+        self.assertIn("List: Zuhause", result.content[0].text)
 
     async def test_get_list_accepts_bring_api_dataclasses(self):
         """bring-api 1.x returns dataclasses, not dicts — server must coerce them."""
