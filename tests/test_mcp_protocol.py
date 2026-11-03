@@ -127,9 +127,10 @@ class McpProtocolTests(IsolatedAsyncioTestCase):
         self.bring.complete_item.assert_not_awaited()
 
     async def test_add_item_legacy_uuid_passes_mcp_validation(self):
-        result = await self.invoke("add_item", {"list_uuid": "list-1", "item_id": "Milk", "uuid": "item-1"})
+        item_uuid = "4204b322-44b5-4ed1-9d0a-a647bde960c7"
+        result = await self.invoke("add_item", {"list_uuid": "list-1", "item_id": "Milk", "uuid": item_uuid})
         self.assertFalse(result.isError)
-        self.bring.save_item.assert_awaited_once_with("list-1", "Milk", "", "item-1")
+        self.bring.save_item.assert_awaited_once_with("list-1", "Milk", "", item_uuid)
 
     async def test_resource_discovery_auth_failure_resets_client(self):
         self.bring.load_lists.side_effect = BringAuthException("expired")
@@ -233,7 +234,7 @@ class McpProtocolTests(IsolatedAsyncioTestCase):
 
     async def test_invalid_list_selectors_and_options_over_protocol(self):
         for arguments in ({}, {"list_name": ""}, {"list_uuid": ""},
-                          {"list_name": 123}, {"list_uuid": "home", "include_recent": "false"},
+                          {"list_name": 123}, {"list_uuid": "home", "include_recent": "maybe"},
                           {"list_uuid": "home", "format": "xml"}):
             with self.subTest(arguments=arguments):
                 result = await self.invoke("get_list", arguments)

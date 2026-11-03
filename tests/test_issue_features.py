@@ -42,7 +42,7 @@ class IssueFeatureTests(IsolatedAsyncioTestCase):
         for name, extra in (
             ("get_list", {}), ("add_item", {"item_id": "Milk"}),
             ("remove_item", {"item_id": "Milk"}), ("complete_item", {"item_id": "Milk"}),
-            ("batch_update", {"items": [], "operation": "ADD"}),
+            ("batch_update", {"items": [{"itemId": "Milk"}], "operation": "ADD"}),
         ):
             with self.subTest(tool=name):
                 result = await server.call_tool(name, {"list_name": "Home", **extra})
@@ -107,7 +107,7 @@ class IssueFeatureTests(IsolatedAsyncioTestCase):
                 self.assertEqual(result.structuredContent["item_uuid"], "other")
 
     async def test_invalid_get_list_options_rejected(self):
-        for extra in ({"format": "xml"}, {"include_recent": "false"}):
+        for extra in ({"format": "xml"}, {"include_recent": "maybe"}):
             result = await server.call_tool("get_list", {"list_uuid": "home", **extra})
             self.assertTrue(result.isError)
 
@@ -119,12 +119,14 @@ class IssueFeatureTests(IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(resource)["items"]["recently"][0]["uuid"], "bread")
 
     async def test_explicit_and_legacy_uuid_are_returned(self):
-        for extra in ({"item_uuid": "chosen"}, {"uuid": "legacy"},
-                      {"item_uuid": "chosen", "uuid": "legacy"}):
+        chosen = "4204b322-44b5-4ed1-9d0a-a647bde960c7"
+        legacy = "8f3c5a22-44b5-4ed1-9d0a-a647bde960c7"
+        for extra in ({"item_uuid": chosen}, {"uuid": legacy},
+                      {"item_uuid": chosen, "uuid": legacy}):
             with self.subTest(extra=extra):
                 result = await server.call_tool("add_item", {"list_uuid": "home", "item_id": "Eggs", **extra})
                 self.assertFalse(result.isError)
-                self.assertEqual(result.structuredContent["item_uuid"], extra.get("item_uuid", "legacy"))
+                self.assertEqual(result.structuredContent["item_uuid"], extra.get("item_uuid", legacy))
                 self.assertEqual(result.structuredContent["status"], "created")
 
     async def test_missing_item_remove_fails_without_mutation(self):
@@ -146,7 +148,7 @@ class IssueFeatureTests(IsolatedAsyncioTestCase):
     async def test_name_cache_miss_refreshes_and_warm_match_does_not(self):
         server._LIST_NAME_CACHE["old"] = "Old"
         for _ in range(2):
-            result = await server.call_tool("batch_update", {"list_name": "Work", "items": [], "operation": "ADD"})
+            result = await server.call_tool("batch_update", {"list_name": "Work", "items": [{"itemId": "Milk"}], "operation": "ADD"})
             self.assertFalse(result.isError)
         self.bring.load_lists.assert_awaited_once()
         self.assertEqual(self.bring.batch_update_list.await_args.args[0], "work")
