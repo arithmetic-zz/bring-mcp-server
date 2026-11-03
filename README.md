@@ -13,7 +13,7 @@ It exposes Bring! shopping lists to MCP clients such as Codex, Claude Desktop, C
 - `complete_item` — move an item to Recently Purchased, rather than checking it off in place; return its UUID
 - `batch_update` — apply bulk operations (`ADD`, `COMPLETE`, or `REMOVE`) to multiple items
 
-Single-item tools accept `item_id` (preferred), `item_name`, or `item` for the item name, in that order of precedence. Tool failures return a short message with the MCP `isError` flag set to `true`.
+Single-item tools accept `item_id` (preferred), `item_name`, or `item` for the item name, in that order of precedence. Tool failures return a short message with the MCP `isError` flag set to `true`. Unknown parameters are rejected, including unknown fields inside batch items; validation errors identify the tool and parameter. `specification` is an alias for `spec`.
 
 ### Select a list and read its contents
 
@@ -40,6 +40,14 @@ Example tool JSON response:
 
 `purchase` contains open items; `recently` is purchase history. Filtering history leaves `recently` as an empty array in JSON. Dates in item attributes (such as discount validity) are returned as ISO 8601 strings. A cold read lazily fetches list names once; a cached name avoids that extra request.
 
+Use `filter` (or its alias `query`) for a substring lookup across item names, display names, specifications and UUIDs:
+
+```json
+{"list_name": "Home", "filter": "milk", "format": "json", "include_recent": false}
+```
+
+The text and JSON sections contain only matching items. Filtered JSON also includes `matches`, with `item_id`, `item_uuid`, `specification` and `status` (`purchase` or `recently`) for each hit. No hits produce empty sections and matches. Matching normalizes case, whitespace and German umlauts. `include_recent` accepts booleans and case-insensitive strings `"true"`/`"false"`; other values produce a contextual validation error.
+
 ### Add, remove and complete items
 
 `add_item` is an upsert: a matching existing item is updated; a new item is added. `complete_item` moves the item to **Recently Purchased**; it does not check it off in place. `remove_item` deletes it completely. Batch `ADD`, `COMPLETE` and `REMOVE` have the same respective semantics.
@@ -52,7 +60,27 @@ Single-item changes retain a readable first text block and add a JSON text block
 
 For `add_item`, `status` is `updated` when the target UUID was already in `purchase`, otherwise `created` (including re-adding an item from history). Removal returns `removed`; completion returns `completed`. These statuses describe the state read immediately before the write; simultaneous edits by other Bring clients are not atomic with this check.
 
-The server reads the items once before a single-item change, reuses an existing UUID, or assigns a new UUID when adding/completing a new item. Specify `item_uuid` to select among duplicate names or to create a separate same-name item with a new UUID. Name matching uses the exact localized display names returned by `get_list`; use `item_uuid` when referring to an item by another language or spelling. Name-only changes reject ambiguous matches across open items and history rather than choosing an arbitrary item. Removing an unknown name reports an error. `add_item` also accepts legacy `uuid`; `item_uuid` takes precedence. An item-name argument remains required even when a UUID is supplied.
+The server reads the items before a single-item change, reuses an existing UUID, or assigns a new UUID when adding a new item. Specify `item_uuid` to select among duplicate names or to create a separate same-name item with a new, valid UUID. New client-supplied UUIDs are validated before writing; existing legacy identifiers remain addressable. `add_item` also accepts legacy `uuid`; `item_uuid` takes precedence. An item-name argument remains required even when a UUID is supplied.
+
+`item_id` is the base item name, while `spec` is its specification: `{"item_id":"Rotwein","spec":"SMS"}` is displayed as `Rotwein (SMS)`. That complete display name also resolves the existing item, without renaming it. Exact names are matched first, with a fallback that normalizes case, whitespace, German umlauts (including `ue`/`ü`/`u`) and `ß`/`ss`. Ambiguous matches are rejected with candidate UUIDs so the client can retry using `item_uuid`. This is normalization, not translation between languages.
+
+Upsert matches by name or UUID, not by specification. An explicitly supplied `spec` replaces the existing specification; `""` clears it. Omitting it preserves the matched specification. To keep an already-open item completely unchanged, set `on_exists` to `"skip"`; the result has status `skipped`. `"error"` rejects an existing open item. The default `"update"` retains upsert behavior. A matching history item can be re-added. Name-only completion requires an open item, so typos cannot create history entries. Removing an unknown name also reports an error.
+
+### Batch changes
+
+Batch items accept `item_id` / legacy `itemId`, `item_uuid` / legacy `uuid`, and `spec` / `specification`. The first spelling in each pair takes precedence. JSON item objects returned by `get_list` can be passed back with their read-only `attributes` field; it is accepted but omitted from writes, so this does not edit attributes. For example:
+
+```json
+{"list_name":"Home","operation":"ADD","items":[{"item_id":"Milk","specification":"2 l"},{"itemId":"Bread","spec":"wholemeal"}]}
+```
+
+All items are resolved and validated before the batch write. Unknown or ambiguous REMOVE/COMPLETE targets reject the whole request before any mutation; COMPLETE requires open items and cannot create history entries for unknown names. A successful batch retains its readable text summary and adds a JSON text block plus matching `structuredContent`:
+
+```json
+{"list_uuid":"list-1","operation":"ADD","results":[{"item_id":"Milk","item_uuid":"item-1","status":"updated"},{"item_id":"Bread","item_uuid":"item-2","status":"created"}]}
+```
+
+Each result reports its UUID and `created`, `updated`, `removed`, or `completed` status. Each target may occur only once in a batch; duplicate targets are rejected before writing. Preflight and writes are separate API calls, so concurrent changes from other Bring clients can still race with this snapshot; batch validation does not provide a cross-client transaction.
 
 ## Available resources
 

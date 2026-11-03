@@ -84,7 +84,7 @@ class BringServerTests(IsolatedAsyncioTestCase):
         tools = {tool.name: tool for tool in await server.list_tools()}
         add_props = tools["add_item"].inputSchema["properties"]
         self.assertIn("item_uuid", add_props)
-        self.assertNotIn("uuid", add_props)
+        self.assertIn("uuid", add_props)
 
     async def test_get_bring_client_reuses_session_and_login(self):
         with patch.object(server, "Bring", DummyBring), patch.object(server.aiohttp, "ClientSession", DummySession):
@@ -221,18 +221,18 @@ class BringServerTests(IsolatedAsyncioTestCase):
         with patch.object(server, "get_bring_client", AsyncMock(return_value=fake)):
             await server.call_tool(
                 "add_item",
-                {"list_uuid": "list-1", "item_id": "Milk", "item_uuid": "item-1"},
+                {"list_uuid": "list-1", "item_id": "Milk", "item_uuid": "4204b322-44b5-4ed1-9d0a-a647bde960c7"},
             )
             await server.call_tool(
                 "add_item",
-                {"list_uuid": "list-1", "item_id": "Bread", "uuid": "item-2"},
+                {"list_uuid": "list-1", "item_id": "Bread", "uuid": "4204b322-44b5-4ed1-9d0a-a647bde960c8"},
             )
 
         self.assertEqual(
             [call.args for call in fake.save_item.await_args_list],
             [
-                ("list-1", "Milk", "", "item-1"),
-                ("list-1", "Bread", "", "item-2"),
+                ("list-1", "Milk", "", "4204b322-44b5-4ed1-9d0a-a647bde960c7"),
+                ("list-1", "Bread", "", "4204b322-44b5-4ed1-9d0a-a647bde960c8"),
             ],
         )
 
@@ -252,14 +252,16 @@ class BringServerTests(IsolatedAsyncioTestCase):
         fake.batch_update_list.assert_awaited_once()
         args = fake.batch_update_list.await_args.args
         self.assertEqual(args[0], "list-1")
-        self.assertEqual(args[1], [{"itemId": "Milk"}])
+        self.assertEqual(args[1][0]["itemId"], "Milk")
+        self.assertTrue(args[1][0]["uuid"])
+        self.assertEqual(args[1][0]["spec"], "")
         self.assertEqual(args[2], BringItemOperation.ADD)
 
     async def test_validation_errors_are_user_facing(self):
         result = await server.call_tool("add_item", {"list_uuid": "list-1"})
 
         self.assertTrue(result.isError)
-        self.assertEqual(result.content[0].text, "Invalid request: item_id is required")
+        self.assertIn("Invalid request: add_item", result.content[0].text)
 
     async def test_missing_credentials_are_reported_as_configuration_error(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -398,3 +400,111 @@ class BringServerTests(IsolatedAsyncioTestCase):
         server._LIST_NAME_CACHE["list-1"] = "Zuhause"  # noqa: SLF001
         await server.close_bring_client()
         self.assertEqual(server._LIST_NAME_CACHE, {})  # noqa: SLF001
+
+
+class IssueMutationTests(IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.fake = DummyBring(DummySession(), 'test@example.com', 'test')
+        self.fake.get_list.return_value = {'items': {'purchase': [
+            {'itemId': 'Rotwein', 'uuid': 'wine', 'specification': 'SMS'},
+            {'itemId': 'Milk', 'uuid': 'milk', 'specification': '2 l'}], 'recently': [
+            {'itemId': 'Bread', 'uuid': 'bread', 'specification': ''}]}}
+        self.enterContext(patch.object(server, 'get_bring_client', AsyncMock(return_value=self.fake)))
+
+    async def test_display_name_upsert_preserves_original_fields(self):
+        result = await server.call_tool('add_item', {'list_uuid': 'home', 'item_id': 'Rotwein (SMS)'})
+        self.assertFalse(result.isError)
+        self.assertEqual(result.structuredContent['status'], 'updated')
+        self.fake.save_item.assert_awaited_once_with('home', 'Rotwein', 'SMS', 'wine')
+
+    async def test_casefold_upsert_and_explicit_spec_replacement(self):
+        result = await server.call_tool('add_item', {'list_uuid': 'home', 'item_id': '  MILK  ', 'specification': '3 l'})
+        self.assertFalse(result.isError)
+        self.fake.save_item.assert_awaited_once_with('home', 'Milk', '3 l', 'milk')
+
+    async def test_unknown_and_history_only_complete_never_mutate(self):
+        for name in ('Ghost', 'Bread'):
+            result = await server.call_tool('complete_item', {'list_uuid': 'home', 'item_id': name})
+            self.assertTrue(result.isError)
+        self.fake.complete_item.assert_not_awaited()
+
+    async def test_invalid_new_uuid_is_rejected_but_existing_legacy_uuid_works(self):
+        result = await server.call_tool('add_item', {'list_uuid': 'home', 'item_id': 'Eggs', 'item_uuid': 'REPLACE'})
+        self.assertTrue(result.isError)
+        self.fake.save_item.assert_not_awaited()
+        result = await server.call_tool('add_item', {'list_uuid': 'home', 'item_id': 'Milk', 'item_uuid': 'milk'})
+        self.assertFalse(result.isError)
+
+    async def test_skip_existing_never_changes_spec(self):
+        result = await server.call_tool('add_item', {'list_uuid': 'home', 'item_id': 'Milk', 'spec': '9 l', 'on_exists': 'skip'})
+        self.assertFalse(result.isError)
+        self.assertEqual(result.structuredContent['status'], 'skipped')
+        self.fake.save_item.assert_not_awaited()
+
+    async def test_batch_preflight_rejects_missing_before_any_write(self):
+        for operation in ('COMPLETE', 'REMOVE'):
+            result = await server.call_tool('batch_update', {'list_uuid': 'home', 'operation': operation,
+                'items': [{'itemId': 'Milk'}, {'itemId': 'Ghost'}]})
+            self.assertTrue(result.isError)
+        self.fake.batch_update_list.assert_not_awaited()
+
+    async def test_batch_roundtrip_and_result_statuses(self):
+        result = await server.call_tool('batch_update', {'list_uuid': 'home', 'operation': 'ADD', 'items': [
+            {'itemId': 'Milk', 'uuid': 'milk', 'specification': '3 l', 'attributes': []},
+            {'item_id': 'Eggs', 'spec': '6'}]})
+        self.assertFalse(result.isError)
+        self.assertEqual([item['status'] for item in result.structuredContent['results']], ['updated', 'created'])
+        sent = self.fake.batch_update_list.await_args.args[1]
+        self.assertEqual(sent[0]['spec'], '3 l')
+        self.assertEqual(sent[0]['uuid'], 'milk')
+        self.assertTrue(sent[1]['uuid'])
+
+    async def test_unknown_fields_fail_before_network(self):
+        result = await server.call_tool('add_item', {'list_uuid': 'home', 'item_id': 'Milk', 'specifikation': '2 l'})
+        self.assertTrue(result.isError)
+        self.assertIn('add_item', result.content[0].text)
+        self.assertIn('specifikation', result.content[0].text)
+        self.fake.get_list.assert_not_awaited()
+
+    async def test_ambiguity_includes_candidate_uuids(self):
+        self.fake.get_list.return_value['items']['purchase'].append({'itemId': 'Milk', 'uuid': 'milk-2'})
+        result = await server.call_tool('remove_item', {'list_uuid': 'home', 'item_id': 'Milk'})
+        self.assertTrue(result.isError)
+        self.assertIn('milk-2', result.content[0].text)
+        self.assertIn('milk', result.content[0].text)
+
+    async def test_german_spelling_fallback_reuses_existing_item(self):
+        self.fake.get_list.return_value['items']['purchase'] = [
+            {'itemId': 'Küchenrolle', 'uuid': 'kitchen', 'specification': 'Süß'}]
+        for name in ('Kuechenrolle', 'Kuchenrolle', '  KÜCHENROLLE  '):
+            result = await server.call_tool('add_item', {'list_uuid': 'home', 'item_id': name})
+            self.assertFalse(result.isError)
+            self.assertEqual(result.structuredContent['item_uuid'], 'kitchen')
+        self.assertEqual(self.fake.save_item.await_args.args[1:], ('Küchenrolle', 'Süß', 'kitchen'))
+
+    async def test_batch_accepts_but_does_not_write_read_only_attributes(self):
+        result = await server.call_tool('batch_update', {'list_uuid': 'home', 'operation': 'ADD', 'items': [
+            {'itemId': 'Milk', 'uuid': 'milk', 'specification': '3 l', 'attributes': [{'type': 'date', 'value': '2026-11-03'}]}]})
+        self.assertFalse(result.isError)
+        self.assertNotIn('attributes', self.fake.batch_update_list.await_args.args[1][0])
+
+    async def test_batch_blank_name_rejected_before_network(self):
+        for name in ('', '  '):
+            result = await server.call_tool('batch_update', {'list_uuid': 'home', 'operation': 'ADD', 'items': [{'item_id': name}]})
+            self.assertTrue(result.isError)
+            self.assertIn('batch_update', result.content[0].text)
+        self.fake.get_list.assert_not_awaited()
+
+    async def test_uuid_case_equivalence_updates_existing_target(self):
+        value = '4204b322-44b5-4ed1-9d0a-a647bde960c7'
+        self.fake.get_list.return_value['items']['purchase'][1]['uuid'] = value
+        result = await server.call_tool('add_item', {'list_uuid': 'home', 'item_id': 'Milk', 'item_uuid': value.upper()})
+        self.assertFalse(result.isError)
+        self.assertEqual(result.structuredContent['status'], 'updated')
+        self.assertEqual(self.fake.save_item.await_args.args[-1], value)
+
+    async def test_boolean_string_with_newline_is_rejected_before_network(self):
+        result = await server.call_tool('get_list', {'list_uuid': 'home', 'include_recent': 'true\n'})
+        self.assertTrue(result.isError)
+        self.assertIn('get_list/include_recent', result.content[0].text)
+        self.fake.get_list.assert_not_awaited()
