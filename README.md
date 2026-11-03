@@ -38,7 +38,7 @@ Example tool JSON response:
 }
 ```
 
-`purchase` contains open items; `recently` is purchase history. Filtering history leaves `recently` as an empty array in JSON. A cold read lazily fetches list names once; a cached name avoids that extra request.
+`purchase` contains open items; `recently` is purchase history. Filtering history leaves `recently` as an empty array in JSON. Dates in item attributes (such as discount validity) are returned as ISO 8601 strings. A cold read lazily fetches list names once; a cached name avoids that extra request.
 
 ### Add, remove and complete items
 
@@ -52,7 +52,7 @@ Single-item changes retain a readable first text block and add a JSON text block
 
 For `add_item`, `status` is `updated` when the target UUID was already in `purchase`, otherwise `created` (including re-adding an item from history). Removal returns `removed`; completion returns `completed`. These statuses describe the state read immediately before the write; simultaneous edits by other Bring clients are not atomic with this check.
 
-The server reads the items once before a single-item change, reuses an existing UUID, or assigns a new UUID when adding/completing a new item. Specify `item_uuid` to select among duplicate names or to create a separate same-name item with a new UUID. Name-only changes reject ambiguous matches across open items and history rather than choosing an arbitrary item. Removing an unknown name reports an error. `add_item` also accepts legacy `uuid`; `item_uuid` takes precedence. An item-name argument remains required even when a UUID is supplied.
+The server reads the items once before a single-item change, reuses an existing UUID, or assigns a new UUID when adding/completing a new item. Specify `item_uuid` to select among duplicate names or to create a separate same-name item with a new UUID. Name matching uses the exact localized display names returned by `get_list`; use `item_uuid` when referring to an item by another language or spelling. Name-only changes reject ambiguous matches across open items and history rather than choosing an arbitrary item. Removing an unknown name reports an error. `add_item` also accepts legacy `uuid`; `item_uuid` takes precedence. An item-name argument remains required even when a UUID is supplied.
 
 ## Available resources
 

@@ -257,3 +257,25 @@ class McpProtocolTests(IsolatedAsyncioTestCase):
                 self.assertEqual(server._LIST_NAME_CACHE, {})
                 self.assertTrue(self.bring.session.closed)
                 self.bring.save_item.assert_not_awaited()
+
+    async def test_json_tool_and_resource_preserve_item_attribute_dates(self):
+        from bring_api.types import BringItemsResponse
+        self.bring.load_lists.return_value = {"lists": [{"listUuid": "home", "name": "Home"}]}
+        # Parse an API-shaped response with the real library: date strings become datetime objects.
+        self.bring.get_list.return_value = BringItemsResponse.from_json(json.dumps({
+            "uuid": "home", "status": "SHARED", "items": {"purchase": [{
+                "itemId": "Milk", "uuid": "milk", "specification": "2 l",
+                "attributes": [{"type": "discount", "content": {
+                    "discounted": True, "activeFrom": "2026-11-03T10:00:00+00:00",
+                    "activeTo": "2026-11-04T10:00:00+00:00"}}]
+            }], "recently": []}}))
+        result = await self.invoke("get_list", {"list_uuid": "home", "format": "json"})
+        self.assertFalse(result.isError, result.content)
+        payload = json.loads(result.content[0].text)
+        content = payload["items"]["purchase"][0]["attributes"][0]["content"]
+        self.assertEqual(content["activeFrom"], "2026-11-03T10:00:00+00:00")
+        self.assertEqual(content["activeTo"], "2026-11-04T10:00:00+00:00")
+        self.assertTrue(content["discounted"])
+        async with self.connect() as client:
+            resource = await client.read_resource("bring://lists/home")
+        self.assertEqual(json.loads(resource.contents[0].text), payload)

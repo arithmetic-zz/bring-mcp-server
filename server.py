@@ -14,6 +14,7 @@ import os
 import ssl
 import sys
 from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -144,11 +145,18 @@ def _as_dict(value: Any) -> Any:
 
     Why: bring-api returns dataclasses (BringListResponse, BringItemsResponse,
     BringPurchase, ...), but the rest of this server and its tests work with
-    plain dicts. Recursively converting at the boundary keeps both shapes
+    plain JSON-compatible dicts. Datetime attributes use ISO 8601 strings.
+    Recursively converting at the boundary keeps both shapes
     working.
     """
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return dataclasses.asdict(value)
+        value = dataclasses.asdict(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: _as_dict(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_as_dict(item) for item in value]
     return value
 
 
