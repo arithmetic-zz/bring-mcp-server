@@ -261,6 +261,12 @@ def _resolve_item(
                 UUID(item_uuid)
             except (ValueError, AttributeError) as exc:
                 raise ValueError("add_item/item_uuid must be a valid UUID when creating an item") from exc
+        if operation == "add_item" and matches:
+            stored_name = _item_value(matches[0], "itemId", "name")
+            if _match_key(item_id) not in (_match_key(stored_name), _match_key(_display_name(matches[0]))):
+                raise ValueError(
+                    f"add_item: item_uuid '{item_uuid}' names '{stored_name}'; renaming is not supported."
+                )
         return _item_value(matches[0], "uuid") if matches else item_uuid, existed, matches[0] if matches else None
     matches = [item for item in candidates if item_id in (
         _item_value(item, "itemId", "name"), _display_name(item))]

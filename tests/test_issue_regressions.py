@@ -39,6 +39,29 @@ class ShoppingIssueProtocolTests(IsolatedAsyncioTestCase):
     def assert_success(self, result):
         self.assertFalse(result.isError, result.content)
 
+    async def test_uuid_rename_is_rejected_before_writing(self):
+        for alias in ("item_uuid", "uuid"):
+            for item_id, item_uuid in (("White wine", "wine"), ("Toast", "bread")):
+                with self.subTest(alias=alias, item_id=item_id):
+                    result = await self.invoke("add_item", {"item_id": item_id, alias: item_uuid})
+                    self.assertTrue(result.isError)
+                    self.assertIn("renaming is not supported", result.content[0].text)
+        self.bring.save_item.assert_not_awaited()
+
+    async def test_uuid_matching_display_name_still_updates_specification(self):
+        result = await self.invoke("add_item", {"item_id": "  ROTWEIN (SMS)  ", "item_uuid": "wine", "spec": "dry"})
+        self.assert_success(result)
+        self.bring.save_item.assert_awaited_once_with("home", "Rotwein", "dry", "wine")
+
+    async def test_batch_uuid_rename_rejects_the_entire_write(self):
+        result = await self.invoke("batch_update", {"operation": "ADD", "items": [
+            {"item_id": "Rotwein", "item_uuid": "wine", "spec": "dry"},
+            {"item_id": "Toast", "item_uuid": "bread"},
+        ]})
+        self.assertTrue(result.isError)
+        self.assertIn("renaming is not supported", result.content[0].text)
+        self.bring.batch_update_list.assert_not_awaited()
+
     async def test_display_name_add_updates_canonical_item_without_erasing_spec(self):
         result = await self.invoke("add_item", {"item_id": "Rotwein (SMS)"})
         self.assert_success(result)
