@@ -6,18 +6,25 @@ It exposes Bring! shopping lists to MCP clients such as Codex, Claude Desktop, C
 
 ## Available tools
 
-- `get_lists` — list all Bring! shopping lists and their UUIDs
+- `get_lists` — list all Bring! shopping lists and their UUIDs, as text or JSON
 - `get_list` — fetch one shopping list as text or JSON, optionally hiding Recently Purchased
-- `add_item` — add or update an item; return `created`/`updated` and its UUID
+- `search_items` — find items across all shopping lists with list and item identities
+- `add_item` — add, update or restore an item; return its status and UUID
 - `remove_item` — delete an item completely from a list; return its UUID
 - `complete_item` — move an item to Recently Purchased, rather than checking it off in place; return its UUID
-- `batch_update` — apply bulk operations (`ADD`, `COMPLETE`, or `REMOVE`) to multiple items
+- `batch_update` — apply mixed bulk operations and item attribute updates
 
 Single-item tools accept `item_id` (preferred), `item_name`, or `item` for the item name, in that order of precedence. Tool failures return a short message with the MCP `isError` flag set to `true`. Unknown parameters are rejected, including unknown fields inside batch items; validation errors identify the tool and parameter. `specification` is an alias for `spec`.
 
 ### Select a list and read its contents
 
 All list-specific tools accept either `list_uuid` or the exact, case-sensitive `list_name`. At least one is required; `list_uuid` takes precedence when both are supplied. Names are cached after discovery. A name miss refreshes the cache once; unknown names report the available names, and duplicate names require a UUID. If a list was renamed, call `get_lists` to refresh cached names.
+
+`get_lists` keeps its readable default text and also exposes the index as MCP `structuredContent`. Use `{"format":"json"}` to receive JSON text:
+
+```json
+{"lists":[{"name":"Home","list_uuid":"list-1"},{"name":"Hardware","list_uuid":"list-2"}]}
+```
 
 `get_list` defaults to the existing text output with both **To buy** and **Recently Purchased** sections. Set `include_recent` to `false` to omit history, or `format` to `"json"` for the same JSON shape as `bring://lists/{listUuid}`. Both options can be combined:
 
@@ -48,6 +55,14 @@ Use `filter` (or its alias `query`) for a substring lookup across item names, di
 
 The text and JSON sections contain only matching items. Filtered JSON also includes `matches`, with `item_id`, `item_uuid`, `specification` and `status` (`purchase` or `recently`) for each hit. No hits produce empty sections and matches. Matching normalizes case, whitespace and German umlauts. `include_recent` accepts booleans and case-insensitive strings `"true"`/`"false"`; other values produce a contextual validation error.
 
+To find an item without knowing its list, call `search_items`:
+
+```json
+{"filter":"milk","include_recent":false,"format":"json"}
+```
+
+It searches every accessible list with the same normalization and returns `{"matches":[...]}`. Each match includes `list_uuid`, `list_name`, `item_id`, `item_uuid`, `specification` and `status` (`purchase` or `recently`). The default is readable text; JSON is available through `format` and MCP `structuredContent` is always present. An empty search result is `{"matches":[]}`. If any list cannot be read, the call returns an error rather than presenting an incomplete search as complete.
+
 ### Add, remove and complete items
 
 `add_item` is an upsert: a matching existing item is updated; a new item is added. `complete_item` moves the item to **Recently Purchased**; it does not check it off in place. `remove_item` deletes it completely. Batch `ADD`, `COMPLETE` and `REMOVE` have the same respective semantics.
@@ -58,9 +73,11 @@ Single-item changes retain a readable first text block and add a JSON text block
 {"list_uuid": "list-1", "item_id": "Milk", "item_uuid": "item-1", "status": "updated"}
 ```
 
-For `add_item`, `status` is `updated` when the target UUID was already in `purchase`, otherwise `created` (including re-adding an item from history). Removal returns `removed`; completion returns `completed`. These statuses describe the state read immediately before the write; simultaneous edits by other Bring clients are not atomic with this check.
+For `add_item`, `status` is `updated` when the target UUID was already in `purchase`, `restored` when it was in `recently`, and `created` for a new item. Restoring moves the existing UUID back to the open list and preserves the specification when omitted. Removal returns `removed`; completion returns `completed`. These statuses describe the state read immediately before the write; simultaneous edits by other Bring clients are not atomic with this check.
 
 The server reads the items before a single-item change, reuses an existing UUID, or assigns a new UUID when adding a new item. Specify `item_uuid` to select among duplicate names or to create a separate same-name item with a new, valid UUID. New client-supplied UUIDs are validated before writing; existing legacy identifiers remain addressable. `add_item` also accepts legacy `uuid`; `item_uuid` takes precedence. An item-name argument remains required even when a UUID is supplied.
+
+An explicit UUID selects an existing item; it does not rename it. If the supplied name differs from that item's canonical, display or normalized name, the request fails with an explicit unsupported-rename error before writing. This prevents a successful response from silently discarding the requested name change.
 
 `item_id` is the base item name, while `spec` is its specification: `{"item_id":"Rotwein","spec":"SMS"}` is displayed as `Rotwein (SMS)`. That complete display name also resolves the existing item, without renaming it. Exact names are matched first, with a fallback that normalizes case, whitespace, German umlauts (including `ue`/`ü`/`u`) and `ß`/`ss`. Ambiguous matches are rejected with candidate UUIDs so the client can retry using `item_uuid`. This is normalization, not translation between languages.
 
@@ -68,7 +85,7 @@ Upsert matches by name or UUID, not by specification. An explicitly supplied `sp
 
 ### Batch changes
 
-Batch items accept `item_id` / legacy `itemId`, `item_uuid` / legacy `uuid`, and `spec` / `specification`. The first spelling in each pair takes precedence. JSON item objects returned by `get_list` can be passed back with their read-only `attributes` field; it is accepted but omitted from writes, so this does not edit attributes. For example:
+Batch items accept `item_id` / legacy `itemId`, `item_uuid` / legacy `uuid`, and `spec` / `specification`. The first spelling in each pair takes precedence. JSON item objects returned by `get_list` can be passed back with their `attributes` field to write those attributes. For example:
 
 ```json
 {"list_name":"Home","operation":"ADD","items":[{"item_id":"Milk","specification":"2 l"},{"itemId":"Bread","spec":"wholemeal"}]}
@@ -77,10 +94,36 @@ Batch items accept `item_id` / legacy `itemId`, `item_uuid` / legacy `uuid`, and
 All items are resolved and validated before the batch write. Unknown or ambiguous REMOVE/COMPLETE targets reject the whole request before any mutation; COMPLETE requires open items and cannot create history entries for unknown names. A successful batch retains its readable text summary and adds a JSON text block plus matching `structuredContent`:
 
 ```json
-{"list_uuid":"list-1","operation":"ADD","results":[{"item_id":"Milk","item_uuid":"item-1","status":"updated"},{"item_id":"Bread","item_uuid":"item-2","status":"created"}]}
+{"list_uuid":"list-1","operation":"ADD","results":[{"item_id":"Milk","item_uuid":"item-1","operation":"ADD","status":"updated"},{"item_id":"Bread","item_uuid":"item-2","operation":"ADD","status":"created"}]}
 ```
 
-Each result reports its UUID and `created`, `updated`, `removed`, or `completed` status. Each target may occur only once in a batch; duplicate targets are rejected before writing. Preflight and writes are separate API calls, so concurrent changes from other Bring clients can still race with this snapshot; batch validation does not provide a cross-client transaction.
+The global `operation` defaults to `ADD`. Each item can override it, so additions, completions and removals can share one batch request:
+
+```json
+{"list_name":"Home","items":[{"item_id":"Milk"},{"item_id":"Bread","operation":"REMOVE"}]}
+```
+
+Each result reports its UUID, effective operation and actual `created`, `updated`, `restored`, `removed`, `completed`, or `attributes_updated` status. The top-level result `operation` is `MIXED` when items use different operations, otherwise their effective operation. Each target may occur only once in a batch; duplicate targets are rejected before writing. All changes are sent through one bulk API request after successful preflight. Preflight and writes are separate API calls, so concurrent changes from other Bring clients can still race with this snapshot; batch validation does not provide a cross-client transaction.
+
+### Preview changes
+
+`add_item`, `remove_item`, `complete_item` and `batch_update` accept `dry_run: true`. The server reads and resolves the same targets and applies the same validation as a real call, but sends no writes. Preview results have the same JSON structure with `dry_run: true` added; the text identifies the result as a preview. For example:
+
+```json
+{"list_name":"Home","dry_run":true,"items":[{"item_id":"Milk"},{"item_id":"Bread","operation":"REMOVE"}]}
+```
+
+Like `include_recent`, `dry_run` accepts booleans and case-insensitive `"true"`/`"false"` strings. This is a preview, not a reservation: the list may change before execution. A preview of a new item may allocate a UUID that differs from a later call unless supplied explicitly.
+
+### Write item attributes
+
+Use `attributes` on `add_item` or batch `ADD` items, in the same `{type, content}` shape returned by list JSON. The server translates each entry to Bring's singular `attribute` payload with `ATTRIBUTE_UPDATE`; it does not silently discard metadata. Nonempty attributes on batch REMOVE/COMPLETE are rejected. For example:
+
+```json
+{"list_name":"Home","item_id":"Milk","attributes":[{"type":"Deadline","content":{"activeFrom":"2026-11-04T00:00:00+01:00","activeTo":"2026-11-10T23:59:59+01:00"}}]}
+```
+
+For attribute-only edits to an existing open or history item, use batch `operation: "ATTRIBUTE_UPDATE"` with its name/UUID and a nonempty attributes array. This does not restore a history item. Attributes update the supplied types; omitting attributes or passing an empty array on ADD does not clear existing attributes. The server validates the date/type/content shape before writing; unsupported shapes return a contextual error. Attribute changes use the API supported by the installed Bring library; automated tests verify its serialized request without modifying a real shopping list.
 
 ## Available resources
 
@@ -239,8 +282,8 @@ Build on the target OS and architecture:
 ```bash
 .venv/bin/python -m pip install -r requirements-build.txt
 .venv/bin/python -m PyInstaller --noconfirm --clean bring-mcp-server.spec
-.venv/bin/python scripts/package_release.py --binary dist/bring-mcp-server --version v1.2.0 --system macos --arch arm64
-.venv/bin/python scripts/smoke_test.py --archive dist/release/bring-mcp-server-v1.2.0-macos-arm64.tar.gz
+.venv/bin/python scripts/package_release.py --binary dist/bring-mcp-server --version v1.4.0 --system macos --arch arm64
+.venv/bin/python scripts/smoke_test.py --archive dist/release/bring-mcp-server-v1.4.0-macos-arm64.tar.gz
 ```
 
 Adjust the version, system (`macos`, `linux`, `windows`), architecture and executable suffix for your target. The package contains the executable, this README, `.env.example`, the project license and third-party license texts. The real `.env` is never included.

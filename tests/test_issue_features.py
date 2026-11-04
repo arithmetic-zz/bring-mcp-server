@@ -79,7 +79,7 @@ class IssueFeatureTests(IsolatedAsyncioTestCase):
                 self.bring.save_item.reset_mock()
                 result = await server.call_tool("add_item", {"list_uuid": "home", "item_id": name})
                 self.assertFalse(result.isError)
-                self.assertEqual(result.structuredContent["status"], "created")
+                self.assertEqual(result.structuredContent["status"], "restored" if name == "Bread" else "created")
                 uuid = result.structuredContent["item_uuid"]
                 self.assertTrue(uuid)
                 self.assertEqual(self.bring.save_item.await_args.args[3], uuid)

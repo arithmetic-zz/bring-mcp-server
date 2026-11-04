@@ -40,6 +40,9 @@ Keep logging configuration inside `main()` so imports do not override the test r
 - Keep `list_tools()` schemas aligned with `execute_tool()`, including argument aliases. `call_tool()` returns `CallToolResult`: friendly `TextContent` with `isError=True` on failure, `False` on success. Single-item mutations include a second JSON text block and matching `structuredContent` with status and UUID.
 - Preserve `_item_name()` aliases (`item_id`, `item_name`, `item`), `add_item`'s canonical `item_uuid` and legacy `uuid`, and `list_uuid` precedence over the alternative exact `list_name`. Require at least one list selector; reject ambiguous names.
 - Map batch operations (`ADD`, `COMPLETE`, `REMOVE`) to `BringItemOperation`. Single-item removal/completion must use dedicated client methods.
+- Batch items may override the global operation (default `ADD`); preflight the whole request before one bulk write. `ATTRIBUTE_UPDATE` uses singular `attribute` entries with validated `{type, content}`; never silently drop nonempty attributes.
+- `dry_run` on mutations shares real resolution/validation but must send no writes. History ADD returns `restored` while preserving the UUID. Explicit UUID/name mismatches must fail clearly rather than silently rename or ignore the requested name.
+- `get_lists` and `search_items` return structured content alongside text/JSON. Cross-list search uses the existing normalization and reports list identity for every match; a failed list read must not look like a complete search.
 - Resources expose `bring://lists` and `bring://lists/{listUuid}`. Discovery must fall back to the index without credentials/network; unknown resource reads raise `ValueError`. Tool and resource authentication failures must clear client/session/name caches before the next request.
 - Keep `meal_plan` and `weekly_groceries` prompts explicit: call `get_list` before `batch_update` with `ADD`.
 

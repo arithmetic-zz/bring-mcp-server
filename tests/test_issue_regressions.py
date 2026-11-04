@@ -128,9 +128,9 @@ class ShoppingIssueProtocolTests(IsolatedAsyncioTestCase):
         self.assertIn("specifikation", result.content[0].text)
         self.bring.batch_update_list.assert_not_awaited()
 
-    async def test_nested_operation_cannot_override_batch_operation(self):
+    async def test_invalid_nested_operation_cannot_bypass_preflight(self):
         result = await self.invoke("batch_update", {"operation": "ADD", "items": [
-            {"itemId": "Rotwein", "operation": "REMOVE"}]})
+            {"itemId": "Rotwein", "operation": "ERASE"}]})
         self.assertTrue(result.isError)
         self.assertIn("batch_update", result.content[0].text)
         self.assertIn("operation", result.content[0].text)
@@ -162,7 +162,7 @@ class ShoppingIssueProtocolTests(IsolatedAsyncioTestCase):
         self.assert_success(result)
         self.assertIsInstance(result.structuredContent, dict)
         self.assertEqual(result.structuredContent["results"], [
-            {"item_id": "Rotwein", "item_uuid": "wine", "status": "updated"}])
+            {"item_id": "Rotwein", "item_uuid": "wine", "status": "updated", "operation": "ADD"}])
         args = self.bring.batch_update_list.await_args.args
         self.assertEqual(args[1][0]["itemId"], "Rotwein")
         self.assertEqual(args[1][0]["spec"], "SMS")
@@ -198,5 +198,5 @@ class ShoppingIssueProtocolTests(IsolatedAsyncioTestCase):
                     "operation": operation, "items": [{"item_id": "Rotwein"}]})
                 self.assert_success(result)
                 self.assertEqual(result.structuredContent["results"], [
-                    {"item_id": "Rotwein", "item_uuid": "wine", "status": status}])
+                    {"item_id": "Rotwein", "item_uuid": "wine", "status": status, "operation": operation}])
                 self.assertIn("1 item(s)", result.content[0].text)

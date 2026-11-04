@@ -73,7 +73,7 @@ class BringServerTests(IsolatedAsyncioTestCase):
         names = [tool.name for tool in tools]
         self.assertEqual(
             names,
-            ["get_lists", "get_list", "add_item", "remove_item", "complete_item", "batch_update"],
+            ["get_lists", "get_list", "add_item", "remove_item", "complete_item", "batch_update", "search_items"],
         )
         german_markers = ("gibt", "fügt", "entfernt", "markiert", "führt", "liste", "artikel")
         self.assertTrue(
@@ -482,11 +482,13 @@ class IssueMutationTests(IsolatedAsyncioTestCase):
             self.assertEqual(result.structuredContent['item_uuid'], 'kitchen')
         self.assertEqual(self.fake.save_item.await_args.args[1:], ('Küchenrolle', 'Süß', 'kitchen'))
 
-    async def test_batch_accepts_but_does_not_write_read_only_attributes(self):
+    async def test_batch_writes_attributes_as_singular_attribute_changes(self):
         result = await server.call_tool('batch_update', {'list_uuid': 'home', 'operation': 'ADD', 'items': [
-            {'itemId': 'Milk', 'uuid': 'milk', 'specification': '3 l', 'attributes': [{'type': 'date', 'value': '2026-11-03'}]}]})
+            {'itemId': 'Milk', 'uuid': 'milk', 'specification': '3 l', 'attributes': [{'type': 'Deadline', 'content': {'activeTo': '2026-11-03'}}]}]})
         self.assertFalse(result.isError)
-        self.assertNotIn('attributes', self.fake.batch_update_list.await_args.args[1][0])
+        changes = self.fake.batch_update_list.await_args.args[1]
+        self.assertNotIn('attributes', changes[0])
+        self.assertEqual(changes[1]['attribute'], {'type': 'Deadline', 'content': {'activeTo': '2026-11-03'}})
 
     async def test_batch_blank_name_rejected_before_network(self):
         for name in ('', '  '):

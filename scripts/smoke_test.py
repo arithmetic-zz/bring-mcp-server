@@ -26,7 +26,14 @@ async def smoke_test(executable: Path) -> None:
                     async with ClientSession(read, write) as client:
                         await client.initialize()
                         tools = await client.list_tools()
-                        assert {t.name for t in tools.tools} == {"get_lists", "get_list", "add_item", "remove_item", "complete_item", "batch_update"}
+                        assert {t.name for t in tools.tools} == {"get_lists", "get_list", "search_items", "add_item", "remove_item", "complete_item", "batch_update"}
+                        schemas = {tool.name: tool.inputSchema for tool in tools.tools}
+                        assert "format" in schemas["get_lists"]["properties"]
+                        assert "filter" in schemas["search_items"]["properties"]
+                        for name in ("add_item", "remove_item", "complete_item", "batch_update"):
+                            assert "dry_run" in schemas[name]["properties"]
+                        assert "attributes" in schemas["add_item"]["properties"]
+                        assert "operation" in schemas["batch_update"]["properties"]["items"]["items"]["properties"]
                         resources = await client.list_resources()
                         assert [str(r.uri) for r in resources.resources] == ["bring://lists"]
                         templates = await client.list_resource_templates()
@@ -38,6 +45,11 @@ async def smoke_test(executable: Path) -> None:
                         failure = await client.call_tool("get_lists", {})
                         assert failure.isError is True
                         assert failure.content[0].text.startswith("Configuration error:")
+                        for name, args in (("get_lists", {"format": "json"}),
+                                           ("search_items", {"filter": "Milk"}),
+                                           ("batch_update", {"list_uuid": "offline", "items": [{"item_id": "Milk"}], "dry_run": True})):
+                            result = await client.call_tool(name, args)
+                            assert result.isError and result.content[0].text.startswith("Configuration error:")
                         for name in ("add_item", "remove_item", "complete_item"):
                             result = await client.call_tool(name, {"list_uuid": "offline", "item_name": "Offline"})
                             assert result.isError and result.content[0].text.startswith("Configuration error:")
