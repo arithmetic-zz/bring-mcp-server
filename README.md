@@ -1,5 +1,7 @@
 # Bring! MCP Server
 
+![Bring! MCP Server connects AI chat, CLI tools, and agents to the Bring! API](assets/bring-mcp-server-banner.png)
+
 A small [Model Context Protocol](https://modelcontextprotocol.io/) server for the Bring! shopping list API.
 
 It exposes Bring! shopping lists to MCP clients such as Codex, Claude Desktop, Cursor, or any client that can launch a stdio MCP server.
