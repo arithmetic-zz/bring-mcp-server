@@ -11,6 +11,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import ssl
 import sys
 import unicodedata
@@ -66,6 +67,121 @@ _LIST_NAME_CACHE: dict[str, str] = {}
 LISTS_INDEX_URI = "bring://lists"
 
 
+class _BringHTTPError(BringRequestException):
+    """Preserve HTTP diagnostics before bring-api discards the response."""
+
+    def __init__(self, status: int, detail: str, retry_after: str | None = None):
+        super().__init__(f"Bring HTTP {status}")
+        self.status = status
+        self.detail = detail
+        self.retry_after = retry_after
+
+
+def _safe_api_detail(body: str) -> str:
+    """Expose a bounded message, never a complete JSON error/token document."""
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        # HTML proxy error pages and truncated JSON are not useful diagnostics.
+        body = body if not body.lstrip().startswith(("<", "{", "[")) else ""
+    else:
+        if isinstance(payload, (str, int, float)):
+            body = str(payload)
+        else:
+            body = next((payload[key] for key in ("message", "detail", "error")
+                if isinstance(payload, dict) and isinstance(payload.get(key), str)), "")
+    for key in ("BRING_EMAIL", "BRING_PASSWORD"):
+        secret = os.environ.get(key)
+        if secret:
+            body = body.replace(secret, "[redacted]")
+    body = re.sub(r"(?i)Bearer\s+\S+", "Bearer [redacted]", body)
+    body = re.sub(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "[redacted]", body)
+    body = re.sub(r'''(?i)((?:["']?)(?:access[_ -]?token|refresh[_ -]?token|password)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}]+)''',
+        r"\1[redacted]", body)
+    return " ".join(body.split())[:512]
+
+
+async def _check_bring_response(response: aiohttp.ClientResponse) -> None:
+    """Capture HTTP errors for login and API calls before library parsing/retry.
+
+    Failed writes are not automatically replayed: clients receive diagnostics
+    and decide whether to retry, checking the list first after uncertain writes.
+    """
+    if response.status < 400:
+        return
+    body = bytearray()
+    try:
+        while len(body) < 8192:
+            chunk = await response.content.read(8192 - len(body))
+            if not chunk:
+                break
+            body.extend(chunk)
+    except (aiohttp.ClientError, TimeoutError):
+        pass  # Keep the HTTP status even if the error body cannot be read.
+    finally:
+        response.release()
+    detail = _safe_api_detail(body.decode("utf-8", errors="replace"))
+    retry_after = response.headers.get("Retry-After")
+    raise _BringHTTPError(response.status, detail, retry_after[:128] if retry_after else None)
+
+
+def _request_error_info(exc: BaseException) -> dict[str, Any]:
+    status = None
+    detail = ""
+    retry_after = None
+    temporary = False
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (_BringHTTPError, aiohttp.ClientResponseError)):
+            status = current.status
+            if isinstance(current, _BringHTTPError):
+                detail, retry_after = current.detail, current.retry_after
+            else:
+                detail = _safe_api_detail(current.message)
+                retry_after = current.headers.get("Retry-After") if current.headers else None
+            break
+        temporary = temporary or isinstance(current, (aiohttp.ClientConnectionError, TimeoutError))
+        current = current.__cause__ or current.__context__
+    category = "request"
+    if status in (401, 403) or isinstance(exc, BringAuthException):
+        category = "authentication"
+    elif status == 429:
+        category = "rate_limit"
+    elif (status is not None and 500 <= status <= 599) or temporary:
+        category = "temporary"
+    elif status in (400, 422):
+        category = "invalid_request"
+    info = {"http_status": status, "category": category,
+        "retryable": category in ("temporary", "rate_limit")}
+    if detail:
+        info["detail"] = detail
+    if retry_after:
+        info["retry_after"] = _safe_api_detail(retry_after)[:128]
+    return info
+
+
+async def _api_error_result(exc: BaseException) -> CallToolResult:
+    info = _request_error_info(exc)
+    if info["category"] == "authentication":
+        await close_bring_client()
+    hints = {"authentication": "Authentication failed. Check BRING_EMAIL and BRING_PASSWORD.",
+        "invalid_request": "The request payload or parameters were rejected; correct the request before retrying.",
+        "rate_limit": "Rate limit reached. Wait before retrying.",
+        "temporary": "Temporary Bring API or network problem. Check the list before retrying a write."}
+    message = "Bring API request failed."
+    if info["http_status"] is not None:
+        message = f"Bring API request failed (HTTP {info['http_status']})."
+    elif info["category"] == "authentication":
+        message = hints["authentication"]
+    if info["category"] in hints and message != hints[info["category"]]:
+        message += " " + hints[info["category"]]
+    if info.get("detail"):
+        message += " " + info["detail"]
+    return CallToolResult(content=_text(message), structuredContent={"error": {**info, "message": message}}, isError=True)
+
+
 def _require_credentials() -> tuple[str, str]:
     email = os.environ.get("BRING_EMAIL")
     password = os.environ.get("BRING_PASSWORD")
@@ -85,7 +201,8 @@ async def get_bring_client() -> Bring:
             email, password = _require_credentials()
             context = ssl.create_default_context(cafile=certifi.where())
             connector = aiohttp.TCPConnector(ssl=context)
-            session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=30))
+            session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=30),
+                raise_for_status=_check_bring_response)
             client = Bring(session, email, password)
 
             try:
@@ -299,22 +416,24 @@ async def _validated_arguments(name: str, arguments: dict[str, Any]) -> dict[str
     schemas = {tool.name: tool.inputSchema for tool in await list_tools()}
     if name not in schemas:
         raise ValueError(f"Unknown tool: {name}")
+    # Reject the entire request before list resolution, including previews and
+    # old clients still using the v1.4.0 attribute-write interface.
+    inputs = [(name, arguments)] if name == "add_item" else []
+    if name == "batch_update":
+        inputs.append((name, arguments))
+        if isinstance(arguments.get("items"), list):
+            inputs.extend((f"{name}/items/{index}", item)
+                for index, item in enumerate(arguments["items"]) if isinstance(item, dict))
+    for prefix, item in inputs:
+        if item.get("attributes") or item.get("operation") == "ATTRIBUTE_UPDATE":
+            raise ValueError(f"{prefix}: Bring attribute writes are not supported: the API rejects "
+                "ATTRIBUTE_UPDATE payloads (HTTP 400). Remove nonempty attributes and use "
+                "ADD, COMPLETE or REMOVE; edit attributes in the Bring app.")
     schema = schemas[name]
     error = next(Draft202012Validator(schema).iter_errors(arguments), None)
     if error:
         path = "/".join(str(part) for part in error.absolute_path)
         raise ValueError(f"{name}{'/' + path if path else ''}: {error.message}")
-    attribute_inputs = [(name, arguments)] if name == "add_item" else [
-        (f"{name}/items/{index}", item) for index, item in enumerate(arguments.get("items", []))] if name == "batch_update" else []
-    for prefix, item in attribute_inputs:
-        for index, attribute in enumerate(item.get("attributes", [])):
-            for field in ("activeFrom", "activeTo"):
-                value = attribute["content"].get(field)
-                if value is not None:
-                    try:
-                        datetime.fromisoformat(value)
-                    except ValueError as exc:
-                        raise ValueError(f"{prefix}/attributes/{index}/content/{field}: expected an ISO 8601 date or datetime") from exc
     arguments = dict(arguments)
     for key in ("include_recent", "dry_run"):
         if isinstance(arguments.get(key), str):
@@ -328,13 +447,8 @@ def _boolean_schema(default: bool) -> dict[str, Any]:
 
 
 def _attributes_schema() -> dict[str, Any]:
-    booleans = {key: {"type": ["boolean", "null"]} for key in ("urgent", "convenient", "discounted")}
-    strings = {key: {"type": ["string", "null"]} for key in (
-        "uuid", "source", "companyBrn", "newItemSection", "newItemIcon", "activeFrom", "activeTo")}
-    return {"type": "array", "description": "Writable Bring attributes. Each type/content pair is sent as ATTRIBUTE_UPDATE; an empty array makes no attribute changes.",
-        "items": {"type": "object", "required": ["type", "content"], "additionalProperties": False,
-                  "properties": {"type": {"type": "string", "pattern": r"\S"},
-                    "content": {"type": "object", "properties": {**booleans, **strings}, "additionalProperties": False}}}}
+    return {"type": "array", "maxItems": 0,
+        "description": "Compatibility only: accepts an empty array. Attribute writes are unsupported; edit attributes in the Bring app."}
 
 
 def _matches_filter(item: dict[str, Any], key: str) -> bool:
@@ -365,22 +479,13 @@ def _plan_change(
     item_id = (arguments.get("item_id") or arguments.get("itemId")) if batch else _item_name(arguments)
     supplied_uuid = arguments.get("item_uuid") or arguments.get("uuid")
     mutation_name = {BringItemOperation.ADD: "add_item", BringItemOperation.REMOVE: "remove_item",
-        BringItemOperation.COMPLETE: "complete_item", BringItemOperation.ATTRIBUTE_UPDATE: "attribute_update"}[operation]
+        BringItemOperation.COMPLETE: "complete_item"}[operation]
     item_uuid, existed, target = _resolve_item(purchase, recently, item_id, supplied_uuid, mutation_name,
         require_open=batch and operation in (BringItemOperation.REMOVE, BringItemOperation.COMPLETE))
     if target:
         item_id = _item_value(target, "itemId", "name")
     spec = _specification(arguments, target)
-    attributes = arguments.get("attributes", [])
-    if attributes and operation not in (BringItemOperation.ADD, BringItemOperation.ATTRIBUTE_UPDATE):
-        raise ValueError(f"{mutation_name}: attributes are supported only with ADD or ATTRIBUTE_UPDATE")
-    if operation == BringItemOperation.ATTRIBUTE_UPDATE:
-        if target is None:
-            raise ValueError(f"Item '{item_id}' not found for ATTRIBUTE_UPDATE")
-        if not attributes:
-            raise ValueError("ATTRIBUTE_UPDATE requires at least one attribute")
-    status = {BringItemOperation.REMOVE: "removed", BringItemOperation.COMPLETE: "completed",
-        BringItemOperation.ATTRIBUTE_UPDATE: "attributes_updated"}.get(operation)
+    status = {BringItemOperation.REMOVE: "removed", BringItemOperation.COMPLETE: "completed"}.get(operation)
     if operation == BringItemOperation.ADD:
         on_exists = arguments.get("on_exists", "update")
         if existed and on_exists == "error":
@@ -393,9 +498,7 @@ def _plan_change(
     if status == "skipped":
         return [], result
     base = {"itemId": item_id, "spec": spec, "uuid": item_uuid}
-    changes = [] if operation == BringItemOperation.ATTRIBUTE_UPDATE else [{**base, "operation": operation}]
-    changes.extend({**base, "operation": BringItemOperation.ATTRIBUTE_UPDATE, "attribute": attribute}
-        for attribute in attributes)
+    changes = [{**base, "operation": operation}]
     return changes, result
 
 
@@ -585,7 +688,7 @@ async def list_tools() -> list[Tool]:
             props["specification"] = {"type": "string", "description": "Alias for spec; spec takes precedence."}
         if tool.name == "add_item":
             props["attributes"] = _attributes_schema()
-            tool.description += " ADD from Recently Purchased preserves the UUID and returns restored; explicit UUID/name mismatches are rejected because renaming is unsupported. Nonempty attributes are written using ATTRIBUTE_UPDATE alongside ADD."
+            tool.description += " ADD from Recently Purchased preserves the UUID and returns restored; explicit UUID/name mismatches are rejected because renaming is unsupported. Attribute writes are unsupported; nonempty attributes are rejected before network access."
             props["uuid"] = {"type": "string", "description": "Legacy alias for item_uuid; item_uuid takes precedence."}
             props["on_exists"] = {"type": "string", "enum": ["update", "skip", "error"], "default": "update"}
             tool.description += " item_id is the name and spec is the separate specification, displayed as Name (spec). Matches names or this display name exactly, then with case, whitespace and German umlaut spelling normalization. A supplied spec replaces the existing specification; omitted spec preserves it. on_exists=skip leaves an open match unchanged; error rejects it; update is the default. New explicit item_uuid values must be valid UUIDs."
@@ -594,18 +697,17 @@ async def list_tools() -> list[Tool]:
             item_schema["properties"].update({
                 "item_id": {"type": "string"}, "item_uuid": {"type": "string"},
                 "specification": {"type": "string"}, "attributes": _attributes_schema(),
-                "operation": {"type": "string", "enum": ["ADD", "REMOVE", "COMPLETE", "ATTRIBUTE_UPDATE"]},
+                "operation": {"type": "string", "enum": ["ADD", "REMOVE", "COMPLETE"]},
             })
-            props["operation"]["enum"].append("ATTRIBUTE_UPDATE")
             props["operation"]["default"] = "ADD"
             tool.inputSchema["required"].remove("operation")
-            tool.description += " Each item may override the global operation (default ADD). Mixed operations are sent in one Bring request after full preflight. ATTRIBUTE_UPDATE edits existing attributes without restoring history and returns attributes_updated. ADD from history returns restored."
+            tool.description += " Each item may override the global operation (default ADD). Mixed operations are sent in one Bring request after full preflight. Attribute writes are unsupported. ADD from history returns restored."
             item_schema.pop("required")
             item_schema["anyOf"] = [{"required": ["itemId"]}, {"required": ["item_id"]}]
             item_schema["additionalProperties"] = False
             for key in ("item_id", "itemId"):
                 item_schema["properties"][key]["pattern"] = "\\S"
-            tool.description += " Accepts item_id/itemId, item_uuid/uuid and spec/specification (first alias takes precedence). All items are resolved before writing; REMOVE/COMPLETE require open items. Returns per-item UUID and created/updated/restored/removed/completed/attributes_updated status."
+            tool.description += " Accepts item_id/itemId, item_uuid/uuid and spec/specification (first alias takes precedence). All items are resolved before writing; REMOVE/COMPLETE require open items. Returns per-item UUID and created/updated/restored/removed/completed status."
         for key in ("item_id", "item_name", "item"):
             if key in props:
                 props[key]["pattern"] = "\\S"
@@ -701,9 +803,7 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent
             changes, result = _plan_change(purchase, recently, arguments, operation)
             item_id, item_uuid = result["item_id"], result["item_uuid"]
             if not dry_run and changes:
-                if name == "add_item" and arguments.get("attributes"):
-                    await bring.batch_update_list(list_uuid, changes, operation)
-                elif name == "add_item":
+                if name == "add_item":
                     await bring.save_item(list_uuid, item_id, changes[0]["spec"], item_uuid)
                 elif name == "remove_item":
                     await bring.remove_item(list_uuid, item_id, item_uuid)
@@ -753,14 +853,11 @@ async def call_tool(name: str, arguments: Any) -> CallToolResult:
         if str(exc) == "BRING_EMAIL and BRING_PASSWORD must be set":
             return CallToolResult(content=_text(f"Configuration error: {exc}"), isError=True)
         return CallToolResult(content=_text(f"Invalid request: {exc}"), isError=True)
-    except BringAuthException:
-        logger.exception("Bring authentication failed for tool '%s'", name)
-        # Token may have expired; drop the cached client so the next call re-logs in.
-        await close_bring_client()
-        return CallToolResult(content=_text("Authentication failed. Check BRING_EMAIL and BRING_PASSWORD."), isError=True)
-    except BringRequestException:
-        logger.exception("Bring API request failed for tool '%s'", name)
-        return CallToolResult(content=_text("Bring API request failed."), isError=True)
+    except (BringAuthException, BringRequestException, aiohttp.ClientError, TimeoutError) as exc:
+        # Do not log raw exception chains: upstream errors can include private URLs.
+        logger.error("Bring API failure for tool '%s' (category=%s, HTTP=%s)",
+            name, _request_error_info(exc)["category"], _request_error_info(exc)["http_status"])
+        return await _api_error_result(exc)
     except BringParseException:
         logger.exception("Bring API returned invalid data for tool '%s'", name)
         return CallToolResult(content=_text("Bring API returned invalid data."), isError=True)
@@ -795,12 +892,10 @@ async def list_resources() -> list[Resource]:
     try:
         bring = await get_bring_client()
         lists = await _load_lists(bring)
-    except BringAuthException:
-        await close_bring_client()
-        logger.info("list_resources cleared invalid authentication; falling back to index-only", exc_info=True)
-        return resources
-    except (ValueError, BringException, aiohttp.ClientError, OSError):
-        logger.info("list_resources falling back to index-only", exc_info=True)
+    except (ValueError, BringException, aiohttp.ClientError, OSError) as exc:
+        if _request_error_info(exc)["category"] == "authentication":
+            await close_bring_client()
+        logger.info("list_resources falling back to index-only")
         return resources
 
     for shopping_list in lists:
@@ -852,9 +947,12 @@ async def read_resource(uri: AnyUrl) -> str:
             return json.dumps(payload, ensure_ascii=False, indent=2)
 
         raise ValueError(f"Unknown resource URI: {uri_str}")
-    except BringAuthException:
-        await close_bring_client()
-        raise
+    except (BringException, aiohttp.ClientError, OSError) as exc:
+        info = _request_error_info(exc)
+        if info["category"] == "authentication":
+            await close_bring_client()
+        result = await _api_error_result(exc)
+        raise ValueError(result.content[0].text) from None
 
 
 # --- Prompts -----------------------------------------------------------------

@@ -75,21 +75,18 @@ class IssueV140UnitTests(IsolatedAsyncioTestCase):
         self.assertIn('attributes', result.content[0].text)
         self.bring.get_list.assert_not_awaited()
 
-    async def test_attribute_updates_and_mixed_operations_reach_real_transport(self):
+    async def test_mixed_batch_rejects_attributes_before_transport(self):
         bring = Bring(DummySession(), 'test@example.com', 'test')
         bring.get_list = self.bring.get_list
         bring._request = AsyncMock(return_value={})
-        attribute = {'type': 'Deadline', 'content': {'activeTo': '2026-11-10T00:00:00', 'urgent': True, 'uuid': None}}
         with patch.object(server, 'get_bring_client', AsyncMock(return_value=bring)):
             result = await server.call_tool('batch_update', {'list_uuid': 'home', 'items': [
-                {'item_id': 'Bread', 'attributes': [attribute]}, {'item_id': 'Milk', 'operation': 'REMOVE'}]})
-        self.assertFalse(result.isError)
-        bring._request.assert_awaited_once()
-        changes = bring._request.await_args.kwargs['json']['changes']
-        self.assertEqual([x['operation'] for x in changes], ['TO_PURCHASE', 'ATTRIBUTE_UPDATE', 'REMOVE'])
-        self.assertEqual(changes[1]['attribute'], attribute)
-        self.assertEqual(changes[1]['uuid'], 'bread')
-        self.assertNotIn('attributes', changes[0])
+                {'item_id': 'Bread'}, {'item_id': 'Milk', 'operation': 'ATTRIBUTE_UPDATE',
+                 'attributes': [{'type': 'urgent', 'content': {'urgent': True}}]}]})
+        self.assertTrue(result.isError)
+        self.assertIn('attribute writes are not supported', result.content[0].text)
+        bring.get_list.assert_not_awaited()
+        bring._request.assert_not_awaited()
 
     async def test_search_normalizes_decomposed_unicode(self):
         self.bring.get_list.return_value['items']['purchase'] = [{'itemId': 'Küchenrolle', 'uuid': 'paper'}]
@@ -103,7 +100,7 @@ class IssueV140UnitTests(IsolatedAsyncioTestCase):
                 result = await server.call_tool('add_item', {'list_uuid': 'home', 'item_id': 'Milk',
                     'attributes': [{'type': 'Deadline', 'content': {'activeTo': value}}]})
                 self.assertTrue(result.isError)
-                self.assertIn('attributes/0/content/activeTo', result.content[0].text)
+                self.assertIn('attribute writes are not supported', result.content[0].text)
         self.bring.get_list.assert_not_awaited()
 
     async def test_filter_does_not_reinclude_nonmatching_duplicate_uuid(self):

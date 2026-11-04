@@ -32,7 +32,8 @@ async def smoke_test(executable: Path) -> None:
                         assert "filter" in schemas["search_items"]["properties"]
                         for name in ("add_item", "remove_item", "complete_item", "batch_update"):
                             assert "dry_run" in schemas[name]["properties"]
-                        assert "attributes" in schemas["add_item"]["properties"]
+                        assert schemas["add_item"]["properties"]["attributes"]["maxItems"] == 0
+                        assert "ATTRIBUTE_UPDATE" not in schemas["batch_update"]["properties"]["operation"]["enum"]
                         assert "operation" in schemas["batch_update"]["properties"]["items"]["items"]["properties"]
                         resources = await client.list_resources()
                         assert [str(r.uri) for r in resources.resources] == ["bring://lists"]
@@ -53,6 +54,12 @@ async def smoke_test(executable: Path) -> None:
                         for name in ("add_item", "remove_item", "complete_item"):
                             result = await client.call_tool(name, {"list_uuid": "offline", "item_name": "Offline"})
                             assert result.isError and result.content[0].text.startswith("Configuration error:")
+                        for name, args in (
+                            ("add_item", {"list_uuid": "offline", "item_id": "Milk", "attributes": [{"type": "urgent", "content": {"urgent": True}}]}),
+                            ("batch_update", {"list_uuid": "offline", "operation": "ATTRIBUTE_UPDATE", "items": [{"item_id": "Milk"}], "dry_run": True}),
+                        ):
+                            result = await client.call_tool(name, args)
+                            assert result.isError and "attribute writes are not supported" in result.content[0].text
                         try:
                             await client.read_resource("bring://unknown")
                         except McpError:

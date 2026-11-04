@@ -482,13 +482,13 @@ class IssueMutationTests(IsolatedAsyncioTestCase):
             self.assertEqual(result.structuredContent['item_uuid'], 'kitchen')
         self.assertEqual(self.fake.save_item.await_args.args[1:], ('Küchenrolle', 'Süß', 'kitchen'))
 
-    async def test_batch_writes_attributes_as_singular_attribute_changes(self):
-        result = await server.call_tool('batch_update', {'list_uuid': 'home', 'operation': 'ADD', 'items': [
-            {'itemId': 'Milk', 'uuid': 'milk', 'specification': '3 l', 'attributes': [{'type': 'Deadline', 'content': {'activeTo': '2026-11-03'}}]}]})
-        self.assertFalse(result.isError)
-        changes = self.fake.batch_update_list.await_args.args[1]
-        self.assertNotIn('attributes', changes[0])
-        self.assertEqual(changes[1]['attribute'], {'type': 'Deadline', 'content': {'activeTo': '2026-11-03'}})
+    async def test_batch_rejects_unsupported_attribute_writes(self):
+        result = await server.call_tool('batch_update', {'list_uuid': 'home', 'items': [
+            {'itemId': 'Milk', 'attributes': [{'type': 'urgent', 'content': {'urgent': True}}]}]})
+        self.assertTrue(result.isError)
+        self.assertIn('attribute writes are not supported', result.content[0].text)
+        self.fake.get_list.assert_not_awaited()
+        self.fake.batch_update_list.assert_not_awaited()
 
     async def test_batch_blank_name_rejected_before_network(self):
         for name in ('', '  '):

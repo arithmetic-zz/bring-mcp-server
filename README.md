@@ -12,7 +12,7 @@ It exposes Bring! shopping lists to MCP clients such as Codex, Claude Desktop, C
 - `add_item` — add, update or restore an item; return its status and UUID
 - `remove_item` — delete an item completely from a list; return its UUID
 - `complete_item` — move an item to Recently Purchased, rather than checking it off in place; return its UUID
-- `batch_update` — apply mixed bulk operations and item attribute updates
+- `batch_update` — apply mixed ADD, COMPLETE and REMOVE operations
 
 Single-item tools accept `item_id` (preferred), `item_name`, or `item` for the item name, in that order of precedence. Tool failures return a short message with the MCP `isError` flag set to `true`. Unknown parameters are rejected, including unknown fields inside batch items; validation errors identify the tool and parameter. `specification` is an alias for `spec`.
 
@@ -85,7 +85,7 @@ Upsert matches by name or UUID, not by specification. An explicitly supplied `sp
 
 ### Batch changes
 
-Batch items accept `item_id` / legacy `itemId`, `item_uuid` / legacy `uuid`, and `spec` / `specification`. The first spelling in each pair takes precedence. JSON item objects returned by `get_list` can be passed back with their `attributes` field to write those attributes. For example:
+Batch items accept `item_id` / legacy `itemId`, `item_uuid` / legacy `uuid`, and `spec` / `specification`. The first spelling in each pair takes precedence. Items with an empty `attributes` array can be passed back from `get_list`. Nonempty attributes are read-only and must be removed before submitting a mutation. For example:
 
 ```json
 {"list_name":"Home","operation":"ADD","items":[{"item_id":"Milk","specification":"2 l"},{"itemId":"Bread","spec":"wholemeal"}]}
@@ -103,7 +103,7 @@ The global `operation` defaults to `ADD`. Each item can override it, so addition
 {"list_name":"Home","items":[{"item_id":"Milk"},{"item_id":"Bread","operation":"REMOVE"}]}
 ```
 
-Each result reports its UUID, effective operation and actual `created`, `updated`, `restored`, `removed`, `completed`, or `attributes_updated` status. The top-level result `operation` is `MIXED` when items use different operations, otherwise their effective operation. Each target may occur only once in a batch; duplicate targets are rejected before writing. All changes are sent through one bulk API request after successful preflight. Preflight and writes are separate API calls, so concurrent changes from other Bring clients can still race with this snapshot; batch validation does not provide a cross-client transaction.
+Each result reports its UUID, effective operation and actual `created`, `updated`, `restored`, `removed`, or `completed` status. The top-level result `operation` is `MIXED` when items use different operations, otherwise their effective operation. Each target may occur only once in a batch; duplicate targets are rejected before writing. All changes are sent through one bulk API request after successful preflight. Preflight and writes are separate API calls, so concurrent changes from other Bring clients can still race with this snapshot; batch validation does not provide a cross-client transaction.
 
 ### Preview changes
 
@@ -115,15 +115,29 @@ Each result reports its UUID, effective operation and actual `created`, `updated
 
 Like `include_recent`, `dry_run` accepts booleans and case-insensitive `"true"`/`"false"` strings. This is a preview, not a reservation: the list may change before execution. A preview of a new item may allocate a UUID that differs from a later call unless supplied explicitly.
 
-### Write item attributes
+### Item attributes are read-only
 
-Use `attributes` on `add_item` or batch `ADD` items, in the same `{type, content}` shape returned by list JSON. The server translates each entry to Bring's singular `attribute` payload with `ATTRIBUTE_UPDATE`; it does not silently discard metadata. Nonempty attributes on batch REMOVE/COMPLETE are rejected. For example:
+Bring returns attributes in list JSON, including ISO 8601 dates. Attribute **writes are disabled**: the v1.4.0 `ATTRIBUTE_UPDATE` payload is rejected by the live Bring API with HTTP 400. The previous transport-only tests did not establish that Bring accepted these writes.
+
+Use the Bring app to edit attributes. `add_item` and batch items accept `attributes: []` for compatibility, but reject nonempty arrays before any network request. `ATTRIBUTE_UPDATE` is no longer advertised as an operation; old clients receive an explicit unsupported-feature error. A batch containing an unsupported attribute edit is rejected in full. `dry_run` applies exactly the same rejection and never sends a write. Omitting attributes does not request any attribute change.
+
+### API error diagnostics
+
+Failed API calls set MCP `isError: true`. HTTP failures include the status in the readable text and an `error` object in `structuredContent`, for example:
 
 ```json
-{"list_name":"Home","item_id":"Milk","attributes":[{"type":"Deadline","content":{"activeFrom":"2026-11-04T00:00:00+01:00","activeTo":"2026-11-10T23:59:59+01:00"}}]}
+{"error":{"http_status":400,"category":"invalid_request","retryable":false,"detail":"Invalid item payload","message":"Bring API request failed (HTTP 400). The request payload or parameters were rejected; correct the request before retrying. Invalid item payload"}}
 ```
 
-For attribute-only edits to an existing open or history item, use batch `operation: "ATTRIBUTE_UPDATE"` with its name/UUID and a nonempty attributes array. This does not restore a history item. Attributes update the supplied types; omitting attributes or passing an empty array on ADD does not clear existing attributes. The server validates the date/type/content shape before writing; unsupported shapes return a contextual error. Attribute changes use the API supported by the installed Bring library; automated tests verify its serialized request without modifying a real shopping list.
+- **400 / 422:** `invalid_request`; fix the payload or parameters before retrying.
+- **401 / 403:** `authentication`; client, session and list-name caches are cleared so the next call logs in again. Check credentials if authentication keeps failing.
+- **429:** `rate_limit`; `retryable: true`, with `retry_after` when Bring supplies a `Retry-After` header (seconds or an HTTP date).
+- **5xx / connection errors / timeouts:** `temporary`; `retryable: true`. Network failures have `http_status: null`.
+- Other HTTP errors and unclassified request failures use `request`, with `retryable: false`; the status is `null` when unavailable.
+
+API response details are limited to 512 characters; JSON responses expose only a string `message`, `detail` or `error` field. Known credentials and common token formats are redacted. Raw response documents, headers other than `Retry-After`, and request URLs are not returned. HTML error pages and incomplete JSON bodies are omitted. Resource reads return the same readable diagnostics; resource discovery still falls back to the lists index when Bring is unavailable.
+
+HTTP failures are surfaced before the Bring library's internal error parsing and retries, including during login. The server does not automatically replay a failed HTTP request. `retryable` describes the error category, not a guarantee that a write had no effect: read the list before repeating a write after a timeout or server error.
 
 ## Available resources
 
