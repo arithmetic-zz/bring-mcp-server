@@ -13,6 +13,7 @@ import logging
 import os
 import ssl
 import sys
+import unicodedata
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
@@ -228,7 +229,7 @@ def _display_name(item: dict[str, Any]) -> str:
 
 def _match_key(value: str) -> str:
     """Fold common German spelling variants for fallback matching only."""
-    value = " ".join(value.split()).casefold()
+    value = " ".join(unicodedata.normalize("NFC", value).split()).casefold()
     for source, target in (("ä", "a"), ("ö", "o"), ("ü", "u"),
                            ("ae", "a"), ("oe", "o"), ("ue", "u")):
         value = value.replace(source, target)
@@ -261,6 +262,10 @@ def _resolve_item(
                 UUID(item_uuid)
             except (ValueError, AttributeError) as exc:
                 raise ValueError("add_item/item_uuid must be a valid UUID when creating an item") from exc
+        if matches and _match_key(item_id) not in (
+            _match_key(_item_value(matches[0], "itemId", "name")), _match_key(_display_name(matches[0]))):
+            stored_name = _item_value(matches[0], "itemId", "name")
+            raise ValueError(f"Item UUID '{item_uuid}' belongs to '{stored_name}', not '{item_id}'; renaming items is not supported.")
         return _item_value(matches[0], "uuid") if matches else item_uuid, existed, matches[0] if matches else None
     matches = [item for item in candidates if item_id in (
         _item_value(item, "itemId", "name"), _display_name(item))]
@@ -299,14 +304,105 @@ async def _validated_arguments(name: str, arguments: dict[str, Any]) -> dict[str
     if error:
         path = "/".join(str(part) for part in error.absolute_path)
         raise ValueError(f"{name}{'/' + path if path else ''}: {error.message}")
+    attribute_inputs = [(name, arguments)] if name == "add_item" else [
+        (f"{name}/items/{index}", item) for index, item in enumerate(arguments.get("items", []))] if name == "batch_update" else []
+    for prefix, item in attribute_inputs:
+        for index, attribute in enumerate(item.get("attributes", [])):
+            for field in ("activeFrom", "activeTo"):
+                value = attribute["content"].get(field)
+                if value is not None:
+                    try:
+                        datetime.fromisoformat(value)
+                    except ValueError as exc:
+                        raise ValueError(f"{prefix}/attributes/{index}/content/{field}: expected an ISO 8601 date or datetime") from exc
     arguments = dict(arguments)
-    if isinstance(arguments.get("include_recent"), str):
-        arguments["include_recent"] = arguments["include_recent"].casefold() == "true"
+    for key in ("include_recent", "dry_run"):
+        if isinstance(arguments.get(key), str):
+            arguments[key] = arguments[key].casefold() == "true"
     return arguments
 
 
-def _mutation_result(message: str, list_uuid: str, item_id: str, item_uuid: str, status: str) -> list[TextContent]:
-    payload = {"list_uuid": list_uuid, "item_id": item_id, "item_uuid": item_uuid, "status": status}
+def _boolean_schema(default: bool) -> dict[str, Any]:
+    return {"anyOf": [{"type": "boolean"}, {"type": "string", "pattern":
+        r"^([tT][rR][uU][eE]|[fF][aA][lL][sS][eE])(?![\s\S])"}], "default": default}
+
+
+def _attributes_schema() -> dict[str, Any]:
+    booleans = {key: {"type": ["boolean", "null"]} for key in ("urgent", "convenient", "discounted")}
+    strings = {key: {"type": ["string", "null"]} for key in (
+        "uuid", "source", "companyBrn", "newItemSection", "newItemIcon", "activeFrom", "activeTo")}
+    return {"type": "array", "description": "Writable Bring attributes. Each type/content pair is sent as ATTRIBUTE_UPDATE; an empty array makes no attribute changes.",
+        "items": {"type": "object", "required": ["type", "content"], "additionalProperties": False,
+                  "properties": {"type": {"type": "string", "pattern": r"\S"},
+                    "content": {"type": "object", "properties": {**booleans, **strings}, "additionalProperties": False}}}}
+
+
+def _matches_filter(item: dict[str, Any], key: str) -> bool:
+    return any(key in _match_key(value) for value in (
+        _display_name(item), _item_value(item, "itemId", "name"),
+        _item_value(item, "spec", "specification"), _item_value(item, "uuid")))
+
+
+def _filter_matches(payload: dict[str, Any], lookup: str, include_recent: bool = True) -> list[dict[str, Any]]:
+    key = _match_key(lookup)
+    matches = []
+    for section in ("purchase", "recently"):
+        if section == "recently" and not include_recent:
+            continue
+        for item in payload["items"][section]:
+            if _matches_filter(item, key):
+                matches.append({"item_id": _item_value(item, "itemId", "name"),
+                    "item_uuid": _item_value(item, "uuid"), "specification": _item_value(item, "spec", "specification"),
+                    "status": section})
+    return matches
+
+
+def _plan_change(
+    purchase: list[dict[str, Any]], recently: list[dict[str, Any]],
+    arguments: dict[str, Any], operation: BringItemOperation, *, batch: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Resolve and validate one mutation identically for previews and writes."""
+    item_id = (arguments.get("item_id") or arguments.get("itemId")) if batch else _item_name(arguments)
+    supplied_uuid = arguments.get("item_uuid") or arguments.get("uuid")
+    mutation_name = {BringItemOperation.ADD: "add_item", BringItemOperation.REMOVE: "remove_item",
+        BringItemOperation.COMPLETE: "complete_item", BringItemOperation.ATTRIBUTE_UPDATE: "attribute_update"}[operation]
+    item_uuid, existed, target = _resolve_item(purchase, recently, item_id, supplied_uuid, mutation_name,
+        require_open=batch and operation in (BringItemOperation.REMOVE, BringItemOperation.COMPLETE))
+    if target:
+        item_id = _item_value(target, "itemId", "name")
+    spec = _specification(arguments, target)
+    attributes = arguments.get("attributes", [])
+    if attributes and operation not in (BringItemOperation.ADD, BringItemOperation.ATTRIBUTE_UPDATE):
+        raise ValueError(f"{mutation_name}: attributes are supported only with ADD or ATTRIBUTE_UPDATE")
+    if operation == BringItemOperation.ATTRIBUTE_UPDATE:
+        if target is None:
+            raise ValueError(f"Item '{item_id}' not found for ATTRIBUTE_UPDATE")
+        if not attributes:
+            raise ValueError("ATTRIBUTE_UPDATE requires at least one attribute")
+    status = {BringItemOperation.REMOVE: "removed", BringItemOperation.COMPLETE: "completed",
+        BringItemOperation.ATTRIBUTE_UPDATE: "attributes_updated"}.get(operation)
+    if operation == BringItemOperation.ADD:
+        on_exists = arguments.get("on_exists", "update")
+        if existed and on_exists == "error":
+            raise ValueError(f"add_item: Item '{item_id}' already exists (item_uuid: {item_uuid}).")
+        status = "skipped" if existed and on_exists == "skip" else (
+            "updated" if existed else "restored" if target else "created")
+    result = {"item_id": item_id, "item_uuid": item_uuid, "status": status}
+    if batch:
+        result["operation"] = operation.name
+    if status == "skipped":
+        return [], result
+    base = {"itemId": item_id, "spec": spec, "uuid": item_uuid}
+    changes = [] if operation == BringItemOperation.ATTRIBUTE_UPDATE else [{**base, "operation": operation}]
+    changes.extend({**base, "operation": BringItemOperation.ATTRIBUTE_UPDATE, "attribute": attribute}
+        for attribute in attributes)
+    return changes, result
+
+
+def _mutation_result(message: str, payload: dict[str, Any], dry_run: bool = False) -> list[TextContent]:
+    if dry_run:
+        payload = {**payload, "dry_run": True}
+        message = f"Preview only — no changes made. {message}"
     return _text(message) + _text(json.dumps(payload, ensure_ascii=False))
 
 
@@ -337,7 +433,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="add_item",
-            description="Add an item, or update it if it already exists. Returns created/updated status and item_uuid. Duplicate names require item_uuid.",
+            description="Add an item, or update it if it already exists. Returns created/updated/restored status and item_uuid. Duplicate names require item_uuid.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -464,9 +560,20 @@ async def list_tools() -> list[Tool]:
         ),
     ]
 
+    tools.append(Tool(name="search_items", description="Search all Bring! lists using normalized name, specification, display name or UUID substrings. Matches include list_uuid, list_name, item_uuid and purchase/recently status.",
+        inputSchema={"type": "object", "properties": {
+            "filter": {"type": "string", "pattern": r"\S"}, "query": {"type": "string", "pattern": r"\S"},
+            "format": {"type": "string", "enum": ["text", "json"], "default": "text"},
+            "include_recent": _boolean_schema(True)}, "anyOf": [{"required": ["filter"]}, {"required": ["query"]}]}))
     for tool in tools:
         tool.inputSchema["additionalProperties"] = False
         props = tool.inputSchema["properties"]
+        if tool.name == "get_lists":
+            props["format"] = {"type": "string", "enum": ["text", "json"], "default": "text"}
+            tool.description += " Use format=json for a structured index; structuredContent always contains names and list_uuid values."
+        if tool.name in ("add_item", "remove_item", "complete_item", "batch_update"):
+            props["dry_run"] = _boolean_schema(False)
+            tool.description += " dry_run=true previews the same resolution and validation without writes; previews do not reserve state or UUIDs."
         if tool.name == "get_list":
             props["include_recent"] = {"anyOf": [
                 {"type": "boolean"},
@@ -477,6 +584,8 @@ async def list_tools() -> list[Tool]:
         if tool.name in ("add_item", "complete_item"):
             props["specification"] = {"type": "string", "description": "Alias for spec; spec takes precedence."}
         if tool.name == "add_item":
+            props["attributes"] = _attributes_schema()
+            tool.description += " ADD from Recently Purchased preserves the UUID and returns restored; explicit UUID/name mismatches are rejected because renaming is unsupported. Nonempty attributes are written using ATTRIBUTE_UPDATE alongside ADD."
             props["uuid"] = {"type": "string", "description": "Legacy alias for item_uuid; item_uuid takes precedence."}
             props["on_exists"] = {"type": "string", "enum": ["update", "skip", "error"], "default": "update"}
             tool.description += " item_id is the name and spec is the separate specification, displayed as Name (spec). Matches names or this display name exactly, then with case, whitespace and German umlaut spelling normalization. A supplied spec replaces the existing specification; omitted spec preserves it. on_exists=skip leaves an open match unchanged; error rejects it; update is the default. New explicit item_uuid values must be valid UUIDs."
@@ -484,18 +593,23 @@ async def list_tools() -> list[Tool]:
             item_schema = props["items"]["items"]
             item_schema["properties"].update({
                 "item_id": {"type": "string"}, "item_uuid": {"type": "string"},
-                "specification": {"type": "string"}, "attributes": {"type": "array", "description": "Read-only metadata accepted for get_list roundtrips; not written."},
+                "specification": {"type": "string"}, "attributes": _attributes_schema(),
+                "operation": {"type": "string", "enum": ["ADD", "REMOVE", "COMPLETE", "ATTRIBUTE_UPDATE"]},
             })
+            props["operation"]["enum"].append("ATTRIBUTE_UPDATE")
+            props["operation"]["default"] = "ADD"
+            tool.inputSchema["required"].remove("operation")
+            tool.description += " Each item may override the global operation (default ADD). Mixed operations are sent in one Bring request after full preflight. ATTRIBUTE_UPDATE edits existing attributes without restoring history and returns attributes_updated. ADD from history returns restored."
             item_schema.pop("required")
             item_schema["anyOf"] = [{"required": ["itemId"]}, {"required": ["item_id"]}]
             item_schema["additionalProperties"] = False
             for key in ("item_id", "itemId"):
                 item_schema["properties"][key]["pattern"] = "\\S"
-            tool.description += " Accepts item_id/itemId, item_uuid/uuid and spec/specification (first alias takes precedence). All items are resolved before writing; REMOVE/COMPLETE require open items. Returns per-item UUID and created/updated/removed/completed status."
+            tool.description += " Accepts item_id/itemId, item_uuid/uuid and spec/specification (first alias takes precedence). All items are resolved before writing; REMOVE/COMPLETE require open items. Returns per-item UUID and created/updated/restored/removed/completed/attributes_updated status."
         for key in ("item_id", "item_name", "item"):
             if key in props:
                 props[key]["pattern"] = "\\S"
-        if tool.name == "get_lists":
+        if tool.name in ("get_lists", "search_items"):
             continue
         schema = tool.inputSchema
         schema["properties"]["list_name"] = {
@@ -512,14 +626,31 @@ async def list_tools() -> list[Tool]:
 async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     arguments = await _validated_arguments(name, arguments)
     if name == "get_lists":
+        lists = await _load_lists(await get_bring_client())
+        payload = {"lists": [{"name": item["name"], "list_uuid": item["listUuid"]} for item in lists]}
+        if arguments.get("format", "text") == "json":
+            return _text(json.dumps(payload, ensure_ascii=False))
+        lines = ["Your shopping lists:"] if lists else ["No shopping lists found."]
+        lines.extend(f"• {lst['name']} (UUID: {lst['listUuid']})" for lst in lists)
+        return _text("\n".join(lines)) + _text(json.dumps(payload, ensure_ascii=False))
+
+    if name == "search_items":
         bring = await get_bring_client()
         lists = await _load_lists(bring)
-        if not lists:
-            return _text("No shopping lists found.")
-
-        lines = ["Your shopping lists:"]
-        lines.extend(f"• {lst['name']} (UUID: {lst['listUuid']})" for lst in lists)
-        return _text("\n".join(lines))
+        matches = []
+        lookup = arguments.get("filter", arguments.get("query"))
+        for shopping_list in lists:
+            list_uuid = shopping_list["listUuid"]
+            payload = await _get_list_payload(bring, list_uuid)
+            matches.extend({**item, "list_uuid": list_uuid, "list_name": shopping_list["name"]}
+                for item in _filter_matches(payload, lookup, arguments.get("include_recent", True)))
+        payload = {"matches": matches}
+        if arguments.get("format", "text") == "json":
+            return _text(json.dumps(payload, ensure_ascii=False))
+        lines = [f"Found {len(matches)} matching item(s):"]
+        lines.extend(f"• {item['list_name']} [list UUID: {item['list_uuid']}]: {item['item_id']}"
+            f" ({item['specification']}) [UUID: {item['item_uuid']}] — {item['status']}" for item in matches)
+        return _text("\n".join(lines)) + _text(json.dumps(payload, ensure_ascii=False))
 
     if name == "get_list":
         list_uuid = await _resolve_list_uuid(arguments)
@@ -535,17 +666,9 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent
             payload["items"]["recently"] = []
         lookup = arguments.get("filter", arguments.get("query"))
         if lookup is not None:
-            key = _match_key(lookup)
-            matches = []
+            matches = _filter_matches(payload, lookup)
             for section in ("purchase", "recently"):
-                payload["items"][section] = [item for item in payload["items"][section] if any(
-                    key in _match_key(value) for value in (
-                        _display_name(item), _item_value(item, "itemId", "name"),
-                        _item_value(item, "spec", "specification"), _item_value(item, "uuid")))]
-                matches.extend({"item_id": _item_value(item, "itemId", "name"),
-                                "item_uuid": _item_value(item, "uuid"),
-                                "specification": _item_value(item, "spec", "specification"),
-                                "status": section} for item in payload["items"][section])
+                payload["items"][section] = [item for item in payload["items"][section] if _matches_filter(item, _match_key(lookup))]
             payload["matches"] = matches
         if output_format == "json":
             return _text(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -566,78 +689,54 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> list[TextContent
 
         return _text("\n".join(lines))
 
-    if name in ("add_item", "remove_item", "complete_item"):
+    if name in ("add_item", "remove_item", "complete_item", "batch_update"):
         list_uuid = await _resolve_list_uuid(arguments)
-        item_id = _item_name(arguments)
-        supplied_uuid = arguments.get("item_uuid")
-        if name == "add_item":
-            supplied_uuid = supplied_uuid or arguments.get("uuid")
         bring = await get_bring_client()
         response = _as_dict(await bring.get_list(list_uuid))
         purchase, recently = _normalize_items(response.get("items"))
-        item_uuid, existed, target = _resolve_item(purchase, recently, item_id, supplied_uuid, name)
-        if target:
-            item_id = _item_value(target, "itemId", "name")
-        spec = _specification(arguments, target)
-        if name == "add_item":
-            on_exists = arguments.get("on_exists", "update")
-            if existed and on_exists == "error":
-                raise ValueError(f"add_item: Item '{item_id}' already exists (item_uuid: {item_uuid}).")
-            if existed and on_exists == "skip":
-                return _mutation_result(f"✓ Skipped existing '{item_id}'.", list_uuid, item_id, item_uuid, "skipped")
-            await bring.save_item(list_uuid, item_id, spec, item_uuid)
-            status = "updated" if existed else "created"
-            message = f"✓ {'Updated' if existed else 'Added'} '{item_id}' in the list."
-        elif name == "remove_item":
-            await bring.remove_item(list_uuid, item_id, item_uuid)
-            status = "removed"
-            message = f"✓ Removed '{item_id}' from the list."
-        else:
-            await bring.complete_item(list_uuid, item_id, spec, item_uuid)
-            status = "completed"
-            message = f"✓ Moved '{item_id}' to Recently Purchased."
-        return _mutation_result(message, list_uuid, item_id, item_uuid, status)
+        dry_run = arguments.get("dry_run", False)
+        if name != "batch_update":
+            operation = {"add_item": BringItemOperation.ADD, "remove_item": BringItemOperation.REMOVE,
+                "complete_item": BringItemOperation.COMPLETE}[name]
+            changes, result = _plan_change(purchase, recently, arguments, operation)
+            item_id, item_uuid = result["item_id"], result["item_uuid"]
+            if not dry_run and changes:
+                if name == "add_item" and arguments.get("attributes"):
+                    await bring.batch_update_list(list_uuid, changes, operation)
+                elif name == "add_item":
+                    await bring.save_item(list_uuid, item_id, changes[0]["spec"], item_uuid)
+                elif name == "remove_item":
+                    await bring.remove_item(list_uuid, item_id, item_uuid)
+                else:
+                    await bring.complete_item(list_uuid, item_id, changes[0]["spec"], item_uuid)
+            messages = {"created": f"✓ Added '{item_id}' in the list.", "updated": f"✓ Updated '{item_id}' in the list.",
+                "restored": f"✓ Restored '{item_id}' from Recently Purchased.", "skipped": f"✓ Skipped existing '{item_id}'.",
+                "removed": f"✓ Removed '{item_id}' from the list.", "completed": f"✓ Moved '{item_id}' to Recently Purchased."}
+            return _mutation_result(messages[result["status"]], {"list_uuid": list_uuid, **result}, dry_run)
 
-    if name == "batch_update":
-        list_uuid = await _resolve_list_uuid(arguments)
-        items = arguments.get("items", [])
-        operation_name = str(arguments.get("operation", "ADD")).upper()
-        try:
-            operation = BringItemOperation[operation_name]
-        except KeyError as exc:
-            raise ValueError(f"Unsupported batch operation: {operation_name}") from exc
-
-        bring = await get_bring_client()
-        response = _as_dict(await bring.get_list(list_uuid))
-        purchase, recently = _normalize_items(response.get("items"))
+        default_operation = BringItemOperation[arguments.get("operation", "ADD")]
         purchase = [dict(item) for item in purchase]
         results = []
         changes = []
         seen = set()
-        mutation_name = {"ADD": "add_item", "REMOVE": "remove_item", "COMPLETE": "complete_item"}[operation_name]
-        for item in items:
-            item_id = item.get("item_id") or item.get("itemId")
-            supplied_uuid = item.get("item_uuid") or item.get("uuid")
-            item_uuid, existed, target = _resolve_item(
-                purchase, recently, item_id, supplied_uuid, mutation_name,
-                require_open=operation_name != "ADD")
+        for item in arguments["items"]:
+            operation = BringItemOperation[item.get("operation", default_operation.name)]
+            item_changes, result = _plan_change(purchase, recently, item, operation, batch=True)
+            item_uuid = result["item_uuid"]
             if item_uuid in seen:
                 raise ValueError(f"batch_update/items: Duplicate target item_uuid '{item_uuid}'; send each item once.")
             seen.add(item_uuid)
-            if target:
-                item_id = _item_value(target, "itemId", "name")
-            spec = _specification(item, target)
-            change = {"itemId": item_id, "spec": spec, "uuid": item_uuid}
-            changes.append(change)
-            status = ("updated" if existed else "created") if operation_name == "ADD" else {
-                "REMOVE": "removed", "COMPLETE": "completed"}[operation_name]
-            results.append({"item_id": item_id, "item_uuid": item_uuid, "status": status})
-            if operation_name == "ADD" and not existed:
-                purchase.append({"itemId": item_id, "uuid": item_uuid, "specification": spec})
-        if changes:
-            await bring.batch_update_list(list_uuid, changes, operation)
+            changes.extend(item_changes)
+            results.append(result)
+            if result["status"] in ("created", "restored"):
+                purchase.append({"itemId": result["item_id"], "uuid": item_uuid,
+                    "specification": item_changes[0]["spec"]})
+        if changes and not dry_run:
+            await bring.batch_update_list(list_uuid, changes, default_operation)
+        operations = {item["operation"] for item in results}
+        operation_name = next(iter(operations)) if len(operations) == 1 else "MIXED" if operations else default_operation.name
         payload = {"list_uuid": list_uuid, "operation": operation_name, "results": results}
-        return _text(f"✓ Batch operation '{operation.name}' completed for {len(results)} item(s).") + _text(json.dumps(payload, ensure_ascii=False))
+        return _mutation_result(f"✓ Batch operation '{operation_name}' completed for {len(results)} item(s).", payload, dry_run)
 
     raise ValueError(f"Unknown tool: {name}")
 
@@ -647,7 +746,7 @@ async def call_tool(name: str, arguments: Any) -> CallToolResult:
     """Execute a tool and translate known Bring errors into user-friendly text."""
     try:
         content = await execute_tool(name, dict(arguments or {}))
-        metadata = json.loads(content[1].text) if name in ("add_item", "remove_item", "complete_item", "batch_update") else None
+        metadata = json.loads(content[-1].text) if name in ("get_lists", "search_items", "add_item", "remove_item", "complete_item", "batch_update") else None
         return CallToolResult(content=content, structuredContent=metadata, isError=False)
     except ValueError as exc:
         logger.info("Invalid request for tool '%s': %s", name, exc)
