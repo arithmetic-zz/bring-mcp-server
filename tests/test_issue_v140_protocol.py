@@ -104,7 +104,8 @@ class V140ProtocolTests(IsolatedAsyncioTestCase):
         with self.assertLogs(server.logger, level="ERROR"):
             result = await self.invoke("search_items", {"filter": "Milk", "format": "json"})
         self.assertTrue(result.isError)
-        self.assertIsNone(result.structuredContent)
+        self.assertEqual(result.structuredContent["error"]["category"], "authentication")
+        self.assertNotIn("matches", result.structuredContent)
         self.assertIsNone(server._BRING_CLIENT)
         self.assertIsNone(server._BRING_SESSION)
         self.assertEqual(server._LIST_NAME_CACHE, {})
@@ -205,46 +206,36 @@ class V140ProtocolTests(IsolatedAsyncioTestCase):
         self.assertEqual([r["status"] for r in result.structuredContent["results"]], ["restored", "completed"])
         self.assert_no_writes()
 
-    async def test_add_attributes_uses_real_sdk_singular_attribute_transport(self):
+    async def test_add_attributes_rejected_before_real_sdk_transport(self):
         real = Bring(DummySession(), "test@example.com", "test-only")
         real.get_list = AsyncMock(return_value=copy.deepcopy(self.sections))
         real._request = AsyncMock()
         with patch.object(server, "get_bring_client", AsyncMock(return_value=real)):
             result = await self.invoke("add_item", {
                 "list_uuid": "home", "item_id": "Milk", "attributes": [DEADLINE]})
-        self.assert_success(result)
-        real._request.assert_awaited_once()
-        method, url = real._request.await_args.args
-        self.assertEqual(method, "PUT")
-        self.assertTrue(str(url).endswith("/v2/bringlists/home/items"))
-        changes = real._request.await_args.kwargs["json"]["changes"]
-        self.assertEqual([c["operation"] for c in changes], ["TO_PURCHASE", "ATTRIBUTE_UPDATE"])
-        self.assertEqual(changes[1]["attribute"], DEADLINE)
-        self.assertEqual(changes[1]["uuid"], "milk")
-        self.assertNotIn("attributes", changes[1])
+        self.assertTrue(result.isError)
+        self.assertIn("attribute writes are not supported", result.content[0].text)
+        real.get_list.assert_not_awaited()
+        real._request.assert_not_awaited()
 
-    async def test_attribute_only_history_update_does_not_restore(self):
+    async def test_attribute_only_history_update_is_unsupported(self):
         result = await self.invoke("batch_update", {"list_uuid": "home", "items": [
             {"item_id": "Bread", "operation": "ATTRIBUTE_UPDATE", "attributes": [DEADLINE]}]})
-        self.assert_success(result)
-        self.assertEqual(result.structuredContent["results"][0]["status"], "attributes_updated")
-        changes = self.bring.batch_update_list.await_args.args[1]
-        self.assertEqual(len(changes), 1)
-        self.assertEqual(str(changes[0]["operation"]), "ATTRIBUTE_UPDATE")
-        self.assertEqual(changes[0]["uuid"], "bread")
-        self.assertEqual(changes[0]["attribute"], DEADLINE)
+        self.assertTrue(result.isError)
+        self.assertIn("attribute writes are not supported", result.content[0].text)
+        self.bring.get_list.assert_not_awaited()
+        self.assert_no_writes()
 
-    async def test_attribute_roundtrip_writes_metadata_instead_of_dropping_it(self):
+    async def test_attribute_roundtrip_rejected_instead_of_dropping_metadata(self):
         self.sections["items"]["purchase"][0]["attributes"] = [copy.deepcopy(DEADLINE)]
         listing = await self.invoke("get_list", {"list_uuid": "home", "format": "json"})
         items = json.loads(listing.content[0].text)["items"]["purchase"][:1]
         result = await self.invoke("batch_update", {"list_uuid": "home", "items": items})
-        self.assert_success(result)
-        changes = self.bring.batch_update_list.await_args.args[1]
-        self.assertEqual([str(c["operation"]) for c in changes], ["TO_PURCHASE", "ATTRIBUTE_UPDATE"])
-        self.assertEqual(changes[1]["attribute"], DEADLINE)
+        self.assertTrue(result.isError)
+        self.assertIn("attribute writes are not supported", result.content[0].text)
+        self.assert_no_writes()
 
-    async def test_dataclass_attribute_roundtrip_keeps_optional_nulls_and_dates(self):
+    async def test_dataclass_attributes_remain_readable_but_cannot_be_written(self):
         self.sections["items"]["purchase"] = [BringPurchase(
             itemId="Milk", uuid="milk", specification="2 l", attributes=[Attribute(
                 type="Deadline", content=Content(
@@ -256,16 +247,16 @@ class V140ProtocolTests(IsolatedAsyncioTestCase):
         self.assertEqual(items[0]["attributes"][0]["content"]["activeTo"], "2026-11-10T00:00:00+00:00")
         self.assertIsNone(items[0]["attributes"][0]["content"]["source"])
         result = await self.invoke("batch_update", {"list_uuid": "home", "items": items})
-        self.assert_success(result)
-        changes = self.bring.batch_update_list.await_args.args[1]
-        self.assertEqual(changes[1]["attribute"], items[0]["attributes"][0])
+        self.assertTrue(result.isError)
+        self.assertIn("attribute writes are not supported", result.content[0].text)
+        self.assert_no_writes()
 
-    async def test_attribute_dry_run_resolves_without_writing(self):
+    async def test_attribute_dry_run_reports_same_unsupported_error(self):
         result = await self.invoke("add_item", {"list_uuid": "home", "item_id": "Milk",
                                                "attributes": [DEADLINE], "dry_run": True})
-        self.assert_success(result)
-        self.assertEqual(result.structuredContent["item_uuid"], "milk")
-        self.assertIs(result.structuredContent["dry_run"], True)
+        self.assertTrue(result.isError)
+        self.assertIn("attribute writes are not supported", result.content[0].text)
+        self.bring.get_list.assert_not_awaited()
         self.assert_no_writes()
 
     async def test_invalid_attribute_on_later_batch_item_cannot_partially_write(self):
